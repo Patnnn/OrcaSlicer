@@ -20,14 +20,19 @@
 #include "libvgcode/include/Types.hpp"
 #include "libslic3r/libslic3r.h"
 #include "libslic3r/Line.hpp"
+#include "libslic3r/PathTracer.hpp"
 #include <stddef.h>
 #include <functional>
 #include <memory>
 #include <chrono>
 #include <cstdint>
+#include <atomic>
+#include <mutex>
 #include <optional>
+#include <thread>
 
 #include "GLToolbar.hpp"
+#include "GLTexture.hpp"
 #include "Event.hpp"
 #include "Selection.hpp"
 #include "Gizmos/GLGizmosManager.hpp"
@@ -729,6 +734,27 @@ private:
 
     GLVolumeCollection m_volumes;
     GCodeViewer m_gcode_viewer;
+
+    bool m_pathtraced_view{false};
+    GLTexture m_pathtrace_texture;
+    std::thread m_pathtrace_thread;
+    std::atomic<bool> m_pathtrace_cancel{false};
+    std::atomic<bool> m_pathtrace_complete{false};
+    std::atomic<uint64_t> m_pathtrace_preview_revision{0};
+    std::mutex m_pathtrace_result_mutex;
+    PathTraceImage m_pathtrace_result;
+    uint64_t m_pathtrace_displayed_revision{0};
+    size_t m_pathtrace_requested_signature{0};
+    size_t m_pathtrace_result_signature{0};
+    std::vector<PathTraceTriangle> m_pathtrace_scene_triangles;
+    size_t m_pathtrace_scene_signature{0};
+    unsigned int m_pathtrace_gpu_node_buffer{0};
+    unsigned int m_pathtrace_gpu_triangle_buffer{0};
+    unsigned int m_pathtrace_gpu_accumulation_image{0};
+    unsigned int m_pathtrace_gpu_display_image{0};
+    std::array<unsigned int, 2> m_pathtrace_gpu_image_size{0, 0};
+    size_t m_pathtrace_gpu_scene_signature{0};
+    uint32_t m_pathtrace_gpu_samples{0};
 
     RenderTimer m_render_timer;
 
@@ -1520,6 +1546,7 @@ private:
     // scene_dirty is false only for a frame that its requester knows to be overlay-only.
     void _render_frame(bool scene_dirty, bool only_init = false);
     void _render_scene(const Camera& camera, const Size& cnv_size);
+    bool _render_pathtraced_view(const Camera& camera, const Size& cnv_size);
     // Request a frame that only rebuilds the overlay.
     void _set_overlay_as_dirty() { m_overlay_dirty = true; }
     // These read the hover state _picking_pass() sets.

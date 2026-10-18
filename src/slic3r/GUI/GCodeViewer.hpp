@@ -495,6 +495,8 @@ public:
     }
 
     libvgcode::EViewType get_view_type() const { return m_viewer.get_view_type(); }
+    bool is_extrusion_role_visible(libvgcode::EGCodeExtrusionRole role) const { return m_viewer.is_extrusion_role_visible(role); }
+    libvgcode::Color get_gcode_vertex_color(const libvgcode::PathVertex& vertex) const { return m_viewer.get_vertex_color(vertex); }
 
     // ORCA: darken the layers not scrubbed to while using the preview layer slider
     void set_dim_previous_layers(bool value) { m_viewer.set_dim_previous_layers(value); }

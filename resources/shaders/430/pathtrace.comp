@@ -1,0 +1,369 @@
+#version 430
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+struct BvhNode
+{
+    vec4 bounds_min;
+    vec4 bounds_max;
+    uvec4 data;
+};
+
+struct Triangle
+{
+    vec4 a;
+    vec4 b;
+    vec4 c;
+    vec4 albedo;
+};
+
+struct Ray
+{
+    vec3 origin;
+    vec3 direction;
+};
+
+struct Hit
+{
+    float distance;
+    vec3 position;
+    vec3 normal;
+    vec3 albedo;
+    float tag;
+};
+
+layout(std430, binding = 0) readonly buffer NodeBuffer { BvhNode nodes[]; };
+layout(std430, binding = 1) readonly buffer TriangleBuffer { Triangle triangles[]; };
+layout(rgba32f, binding = 0) uniform image2D accumulation_image;
+layout(rgba8, binding = 1) writeonly uniform image2D display_image;
+
+uniform ivec2 image_size;
+uniform vec3 camera_position;
+uniform vec3 camera_right;
+uniform vec3 camera_up;
+uniform vec3 camera_forward;
+uniform float camera_half_fov;
+uniform float camera_orthographic_height;
+uniform bool camera_orthographic;
+uniform int sample_start;
+uniform int sample_count;
+uniform int max_bounces;
+uniform float z_min;
+uniform float z_max;
+
+const float ray_epsilon = 0.0001;
+
+uint random_uint(inout uint state)
+{
+    state ^= state << 13;
+    state ^= state >> 17;
+    state ^= state << 5;
+    return state;
+}
+
+float random_float(inout uint state)
+{
+    return float(random_uint(state) >> 8) * (1.0 / 16777216.0);
+}
+
+// Returns the entry distance into the node bounds, or -1.0 if the ray misses them within max_distance.
+float bounds_entry(BvhNode node, vec3 origin, vec3 inv_dir, float max_distance)
+{
+    if (node.bounds_max.z < min(z_min, -0.05) || node.bounds_min.z > z_max)
+        return -1.0;
+    vec3 t0 = (node.bounds_min.xyz - origin) * inv_dir;
+    vec3 t1 = (node.bounds_max.xyz - origin) * inv_dir;
+    vec3 tmin = min(t0, t1);
+    vec3 tmax = max(t0, t1);
+    float near_distance = max(max(tmin.x, tmin.y), max(tmin.z, ray_epsilon));
+    float far_distance = min(min(tmax.x, tmax.y), min(tmax.z, max_distance));
+    return far_distance >= near_distance ? near_distance : -1.0;
+}
+
+bool intersect_triangle(Triangle triangle, Ray ray, inout Hit hit)
+{
+    if (triangle.a.w >= 0.0 && (triangle.a.w < z_min || triangle.a.w > z_max))
+        return false;
+    vec3 edge1 = triangle.b.xyz - triangle.a.xyz;
+    vec3 edge2 = triangle.c.xyz - triangle.a.xyz;
+    vec3 cross_value = cross(ray.direction, edge2);
+    float determinant = dot(edge1, cross_value);
+    if (abs(determinant) < 1e-10)
+        return false;
+
+    const float edge_epsilon = 2e-4;
+    float inverse_determinant = 1.0 / determinant;
+    vec3 from_a = ray.origin - triangle.a.xyz;
+    float u = dot(from_a, cross_value) * inverse_determinant;
+    if (u < -edge_epsilon || u > 1.0 + edge_epsilon)
+        return false;
+    vec3 q = cross(from_a, edge1);
+    float v = dot(ray.direction, q) * inverse_determinant;
+    if (v < -edge_epsilon || u + v > 1.0 + edge_epsilon)
+        return false;
+    float distance = dot(edge2, q) * inverse_determinant;
+    if (distance < ray_epsilon || distance >= hit.distance)
+        return false;
+
+    vec3 edge3 = triangle.c.xyz - triangle.b.xyz;
+    float len1 = dot(edge1, edge1);
+    float len2 = dot(edge2, edge2);
+    float len3 = dot(edge3, edge3);
+    vec3 raw_normal;
+    if (len1 >= len2 && len1 >= len3)
+        raw_normal = cross(edge3, -edge2);
+    else if (len2 >= len1 && len2 >= len3)
+        raw_normal = cross(edge1, edge3);
+    else
+        raw_normal = cross(edge1, edge2);
+
+    float normal_len = length(raw_normal);
+    if (normal_len <= 0.0)
+        return false;
+
+    float u_clamped = clamp(u, 0.0, 1.0);
+    float v_clamped = clamp(v, 0.0, max(0.0, 1.0 - u_clamped));
+    hit.distance = distance;
+    hit.position = (1.0 - u_clamped - v_clamped) * triangle.a.xyz + u_clamped * triangle.b.xyz + v_clamped * triangle.c.xyz;
+    hit.normal = raw_normal / normal_len;
+    if (dot(hit.normal, ray.direction) > 0.0)
+        hit.normal = -hit.normal;
+    hit.albedo = clamp(triangle.albedo.rgb, vec3(0.0), vec3(1.0));
+    hit.tag = triangle.a.w;
+    return true;
+}
+
+// Front-to-back BVH traversal: the nearer child is visited first so hit.distance shrinks early and prunes
+// the rest of the tree. With any_hit the search stops at the first intersection (occlusion queries).
+bool traverse_scene(Ray ray, inout Hit hit, bool any_hit)
+{
+    if (nodes.length() <= 0)
+        return false;
+
+    vec3 safe_dir = vec3(abs(ray.direction.x) < 1e-8 ? 1e-8 : ray.direction.x,
+                         abs(ray.direction.y) < 1e-8 ? 1e-8 : ray.direction.y,
+                         abs(ray.direction.z) < 1e-8 ? 1e-8 : ray.direction.z);
+    vec3 inv_dir = 1.0 / safe_dir;
+
+    if (bounds_entry(nodes[0], ray.origin, inv_dir, hit.distance) < 0.0)
+        return false;
+
+    bool found = false;
+    uint stack[32];
+    float stack_dist[32];
+    int stack_size = 1;
+    stack[0] = 0u;
+    stack_dist[0] = 0.0;
+    while (stack_size > 0) {
+        --stack_size;
+        if (stack_dist[stack_size] >= hit.distance)
+            continue;
+        BvhNode node = nodes[stack[stack_size]];
+        if (node.data.y > 0u) {
+            for (uint i = node.data.x; i < node.data.x + node.data.y; ++i) {
+                if (intersect_triangle(triangles[i], ray, hit)) {
+                    found = true;
+                    if (any_hit)
+                        return true;
+                }
+            }
+        } else {
+            float dl = bounds_entry(nodes[node.data.z], ray.origin, inv_dir, hit.distance);
+            float dr = bounds_entry(nodes[node.data.w], ray.origin, inv_dir, hit.distance);
+            if (stack_size + 2 > 32)
+                break;
+            uint near_child = node.data.z, far_child = node.data.w;
+            float near_d = dl, far_d = dr;
+            if (dl < 0.0 || (dr >= 0.0 && dr < dl)) {
+                near_child = node.data.w; far_child = node.data.z;
+                near_d = dr; far_d = dl;
+            }
+            if (far_d >= 0.0) {
+                stack[stack_size] = far_child;
+                stack_dist[stack_size++] = far_d;
+            }
+            if (near_d >= 0.0) {
+                stack[stack_size] = near_child;
+                stack_dist[stack_size++] = near_d;
+            }
+        }
+    }
+    return found;
+}
+
+bool intersect_scene(Ray ray, inout Hit hit) { return traverse_scene(ray, hit, false); }
+
+vec3 sky(vec3 direction)
+{
+    float up = clamp(direction.z, -1.0, 1.0);
+    vec3 ground_amb = vec3(0.10, 0.11, 0.13);
+    vec3 horizon    = vec3(0.34, 0.37, 0.42);
+    vec3 zenith     = vec3(0.52, 0.58, 0.68);
+    if (up < 0.0)
+        return mix(horizon, ground_amb, clamp(-up * 1.8, 0.0, 1.0));
+    return mix(horizon, zenith, pow(up, 0.7));
+}
+
+vec3 cosine_hemisphere(vec3 normal, inout uint state)
+{
+    const float pi = 3.14159265358979323846;
+    float angle = 2.0 * pi * random_float(state);
+    float radius = sqrt(random_float(state));
+    float x = radius * cos(angle);
+    float y = radius * sin(angle);
+    float z = sqrt(max(0.0, 1.0 - x * x - y * y));
+    vec3 helper = abs(normal.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(0.0, 1.0, 0.0);
+    vec3 tangent = normalize(cross(helper, normal));
+    vec3 bitangent = cross(normal, tangent);
+    return normalize(tangent * x + bitangent * y + normal * z);
+}
+
+vec4 trace_path(Ray ray, inout uint state)
+{
+    vec3 base_light_dir = normalize(vec3(-0.45, -0.48, 0.75));
+    vec3 light_jitter = vec3(random_float(state) - 0.5, random_float(state) - 0.5, random_float(state) - 0.5);
+    vec3 light_direction = normalize(base_light_dir + light_jitter * 0.045);
+    vec3 fill_direction = normalize(vec3(0.55, 0.35, 0.75));
+
+    Hit hit;
+    hit.distance = 3.402823e+38;
+    if (!intersect_scene(ray, hit))
+        return vec4(0.0, 0.0, 0.0, 0.0);
+
+    float max_coord = max(abs(hit.position.x), max(abs(hit.position.y), abs(hit.position.z)));
+    float normal_offset = max(0.002, max_coord * 1e-4);
+    vec3 offset_origin = hit.position + hit.normal * normal_offset;
+
+    if (hit.tag < -1.5) {
+        Ray shadow_ray_p;
+        shadow_ray_p.origin = offset_origin;
+        shadow_ray_p.direction = light_direction;
+        Hit shadow_hit_p;
+        shadow_hit_p.distance = 3.402823e+38;
+        bool direct_occluded = traverse_scene(shadow_ray_p, shadow_hit_p, true);
+
+        Ray ao_ray_p;
+        ao_ray_p.origin = offset_origin;
+        ao_ray_p.direction = cosine_hemisphere(hit.normal, state);
+        Hit ao_hit_p;
+        ao_hit_p.distance = 3.402823e+38;
+        bool ao_occluded = intersect_scene(ao_ray_p, ao_hit_p);
+
+        float shadow_alpha = 0.0;
+        vec3 shadow_tint = vec3(0.0);
+        if (direct_occluded)
+            shadow_alpha += 0.34;
+        if (ao_occluded) {
+            float ao_falloff = 1.0 / (1.0 + 0.025 * ao_hit_p.distance);
+            shadow_alpha += 0.46 * ao_falloff;
+            shadow_tint = ao_hit_p.albedo * (0.08 * ao_falloff);
+        }
+        shadow_alpha = clamp(shadow_alpha, 0.0, 0.74);
+        return vec4(shadow_tint * shadow_alpha, shadow_alpha);
+    }
+
+    Ray shadow_ray;
+    shadow_ray.origin = offset_origin;
+    shadow_ray.direction = light_direction;
+    Hit shadow_hit;
+    shadow_hit.distance = 3.402823e+38;
+    float shadow_vis = 1.0;
+    if (traverse_scene(shadow_ray, shadow_hit, hit.tag < 0.0)) {
+        if (hit.tag >= 0.0 && shadow_hit.distance < 0.45) {
+            bool same_layer_neighbor = (hit.normal.z > 0.4) && (abs(shadow_hit.position.z - hit.position.z) < 0.25);
+            shadow_vis = same_layer_neighbor ? 0.78 : 0.52;
+        } else {
+            shadow_vis = 0.0;
+        }
+    }
+
+    Ray gi_ray;
+    gi_ray.origin = offset_origin;
+    gi_ray.direction = cosine_hemisphere(hit.normal, state);
+    Hit gi_hit;
+    gi_hit.distance = 3.402823e+38;
+    float ao_vis = 1.0;
+    vec3 indirect_bounce = vec3(0.0);
+    if (intersect_scene(gi_ray, gi_hit)) {
+        if (hit.tag >= 0.0 && gi_hit.distance < 0.45) {
+            bool same_layer_neighbor = (hit.normal.z > 0.4) && (abs(gi_hit.position.z - hit.position.z) < 0.25);
+            ao_vis = same_layer_neighbor ? 0.82 : 0.65;
+        } else {
+            ao_vis = clamp(0.14 + gi_hit.distance * 0.035, 0.14, 0.75);
+            if (gi_hit.tag >= -1.5) {
+                float bounce_ndl = max(0.20, dot(gi_hit.normal, base_light_dir));
+                indirect_bounce = gi_hit.albedo * (0.08 * bounce_ndl);
+            }
+        }
+    }
+
+    vec3 shading_normal = hit.normal;
+    if (hit.tag >= 0.0) {
+        shading_normal = (hit.normal.z > 0.0)
+            ? normalize(vec3(hit.normal.xy * 0.72, hit.normal.z))
+            : normalize(vec3(hit.normal.xy, hit.normal.z * 0.42));
+    }
+    float layer_profile = (hit.tag >= 0.0) ? (0.80 + 0.16 * hit.normal.z) : 1.0;
+
+    float hemi = 0.5 + 0.5 * shading_normal.z;
+    float amb = mix(0.14, 0.24, hemi) * ao_vis;
+    float direct_key = max(0.0, dot(shading_normal, light_direction)) * 0.45 * shadow_vis;
+    float fill_ndl = max(0.0, dot(shading_normal, fill_direction));
+    float cam_ndl = max(0.0, dot(shading_normal, -ray.direction));
+    float direct_fill = (fill_ndl * 0.12 + cam_ndl * 0.06) * mix(0.35, 1.0, ao_vis);
+
+    vec3 view_dir = -ray.direction;
+    vec3 refl_key = reflect(-light_direction, shading_normal);
+    float spec_key = shadow_vis * pow(max(dot(view_dir, refl_key), 0.0), 24.0) * 0.11;
+    vec3 refl_fill = reflect(-fill_direction, shading_normal);
+    float spec_fill = ao_vis * pow(max(dot(view_dir, refl_fill), 0.0), 18.0) * 0.04;
+    float spec_layer = (hit.tag >= 0.0) ? max(0.20, 0.65 + 0.35 * hit.normal.z) : 1.0;
+    float specular = (spec_key + spec_fill) * spec_layer;
+
+    float diffuse_total = (amb + direct_key + direct_fill) * layer_profile;
+    vec3 radiance = hit.albedo * (diffuse_total + indirect_bounce * layer_profile) + vec3(specular);
+    return vec4(radiance, 1.0);
+}
+
+vec3 apply_tone(vec3 color)
+{
+    return clamp(color, vec3(0.0), vec3(1.0));
+}
+
+void main()
+{
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel, image_size)))
+        return;
+
+    uint pixel_seed = uint(pixel.y * image_size.x + pixel.x + 1) * 0x9e3779b9u;
+    vec4 sum = sample_start == 0 ? vec4(0.0) : imageLoad(accumulation_image, pixel);
+    float aspect = float(image_size.x) / float(image_size.y);
+
+    for (int sample_index = 0; sample_index < sample_count; ++sample_index) {
+        uint state = pixel_seed ^ (uint(sample_start + sample_index) * 0x85ebca6bu);
+        vec2 jitter = vec2(random_float(state), random_float(state));
+        if (sample_start == 0 && sample_index == 0)
+            jitter = vec2(0.5);
+        vec2 normalized = (vec2(pixel) + jitter) / vec2(image_size) * 2.0 - 1.0;
+        normalized.y = -normalized.y;
+        Ray ray;
+        if (camera_orthographic) {
+            float half_height = camera_orthographic_height * 0.5;
+            ray.origin = camera_position + camera_right * (normalized.x * aspect * half_height) + camera_up * (normalized.y * half_height);
+            ray.direction = camera_forward;
+        } else {
+            ray.origin = camera_position;
+            ray.direction = normalize(camera_forward + camera_right * (normalized.x * tan(camera_half_fov) * aspect) +
+                                      camera_up * (normalized.y * tan(camera_half_fov)));
+        }
+        sum += trace_path(ray, state);
+    }
+
+    int total_samples = sample_start + sample_count;
+    imageStore(accumulation_image, pixel, sum);
+    vec4 avg = sum / float(total_samples);
+    float out_alpha = clamp(avg.a, 0.0, 1.0);
+    vec3 unpremul = out_alpha > 1e-4 ? (avg.rgb / out_alpha) : vec3(0.0);
+    imageStore(display_image, pixel, vec4(apply_tone(unpremul), out_alpha));
+}

@@ -82,6 +82,7 @@
 #include "libslic3r/Utils.hpp"
 #include "libslic3r/Technologies.hpp"
 #include "libslic3r/Tesselate.hpp"
+#include "libslic3r/TriangleMesh.hpp"
 #include "libslic3r/PresetBundle.hpp"
 #include "libslic3r/AppConfig.hpp"
 #include "3DScene.hpp"
@@ -93,6 +94,7 @@
 #include "GUI.hpp"
 #include "Tab.hpp"
 #include "GUI_Preview.hpp"
+#include "GLTexture.hpp"
 #include "OpenGLManager.hpp"
 #include "Plater.hpp"
 #include "MainFrame.hpp"
@@ -1646,7 +1648,20 @@ GLCanvas3D::GLCanvas3D(wxGLCanvas* canvas, Bed3D &bed)
 
 GLCanvas3D::~GLCanvas3D()
 {
+    m_pathtrace_cancel.store(true, std::memory_order_relaxed);
+    if (m_pathtrace_thread.joinable())
+        m_pathtrace_thread.join();
+
     if (_set_current()) {
+        m_pathtrace_texture.reset();
+        if (m_pathtrace_gpu_node_buffer != 0 || m_pathtrace_gpu_triangle_buffer != 0) {
+            const unsigned int buffers[] = {m_pathtrace_gpu_node_buffer, m_pathtrace_gpu_triangle_buffer};
+            glsafe(::glDeleteBuffers(2, buffers));
+        }
+        if (m_pathtrace_gpu_accumulation_image != 0)
+            glsafe(::glDeleteTextures(1, &m_pathtrace_gpu_accumulation_image));
+        if (m_pathtrace_gpu_display_image != 0)
+            glsafe(::glDeleteTextures(1, &m_pathtrace_gpu_display_image));
         m_scene_cache.reset();
         m_frame_profiler.reset();
         if (m_fxaa_texture_id != 0) {
@@ -2810,37 +2825,57 @@ void GLCanvas3D::_render_scene(const Camera& camera, const Size& cnv_size)
             // Design tab: replace the plate's corner-origin grid with the origin-centred CAD grid.
             _render_cad_grid(camera.get_view_matrix(), camera.get_projection_matrix());
         m_frame_profiler.mark("plates");
-        
-        //BBS: add outline logic
-        // Depth pass for object-on-object and self shadows; consumed by the gouraud shader below.
-        _render_shadows(camera.get_view_matrix(), camera.get_projection_matrix());
-        m_frame_profiler.mark("shadows");
-        _render_objects(GLVolumeCollection::ERenderType::Opaque, !m_gizmos.is_running());
-        m_frame_profiler.mark("objects");
-        _render_sla_slices();
-        _render_selection();
-        _render_objects(GLVolumeCollection::ERenderType::Transparent, !m_gizmos.is_running());
-        _render_wireframe_overlay();
-        m_frame_profiler.mark("transparent");
+
+        if (m_pathtraced_view && _render_pathtraced_view(camera, cnv_size)) {
+            _render_selection();
+            m_frame_profiler.mark("path tracing");
+        } else {
+            //BBS: add outline logic
+            // Depth pass for object-on-object and self shadows; consumed by the gouraud shader below.
+            _render_shadows(camera.get_view_matrix(), camera.get_projection_matrix());
+            m_frame_profiler.mark("shadows");
+            _render_objects(GLVolumeCollection::ERenderType::Opaque, !m_gizmos.is_running());
+            m_frame_profiler.mark("objects");
+            _render_sla_slices();
+            _render_selection();
+            _render_objects(GLVolumeCollection::ERenderType::Transparent, !m_gizmos.is_running());
+            _render_wireframe_overlay();
+            m_frame_profiler.mark("transparent");
+        }
     }
     /* preview render */
     else if (m_canvas_type == ECanvasType::CanvasPreview && m_render_preview) {
-        // Before the shadow pass, so the cut away part casts no shadow.
-        m_gcode_viewer.set_clipping_plane(_get_section_view_plane());
-        _render_objects(GLVolumeCollection::ERenderType::Opaque, !m_gizmos.is_running());
-        _render_sla_slices();
-        _render_selection();
-        m_frame_profiler.mark("objects");
-        _render_bed(camera.get_view_matrix(), camera.get_projection_matrix(), !camera.is_looking_downward(), m_show_world_axes);
-        m_frame_profiler.mark("bed");
-        _render_platelist(camera.get_view_matrix(), camera.get_projection_matrix(), !camera.is_looking_downward(), only_current, true, hover_id);
-        m_frame_profiler.mark("plates");
-        // Realistic view: the print casts a shadow onto the plate here as it does in View3D.
-        _render_shadows(camera.get_view_matrix(), camera.get_projection_matrix());
-        m_frame_profiler.mark("shadows");
-        // BBS: GUI refactor: add canvas size as parameters
-        _render_gcode(cnv_size.get_width(), cnv_size.get_height());
-        m_frame_profiler.mark("gcode");
+        bool pathtraced_rendered = false;
+        if (m_pathtraced_view) {
+            _render_bed(camera.get_view_matrix(), camera.get_projection_matrix(), !camera.is_looking_downward(), m_show_world_axes);
+            m_frame_profiler.mark("bed");
+            _render_platelist(camera.get_view_matrix(), camera.get_projection_matrix(), !camera.is_looking_downward(), only_current, true, hover_id);
+            m_frame_profiler.mark("plates");
+            if (_render_pathtraced_view(camera, cnv_size)) {
+                m_frame_profiler.mark("path tracing");
+                pathtraced_rendered = true;
+            }
+        }
+        if (!pathtraced_rendered) {
+            // Before the shadow pass, so the cut away part casts no shadow.
+            m_gcode_viewer.set_clipping_plane(_get_section_view_plane());
+            _render_objects(GLVolumeCollection::ERenderType::Opaque, !m_gizmos.is_running());
+            _render_sla_slices();
+            _render_selection();
+            m_frame_profiler.mark("objects");
+            if (!m_pathtraced_view) {
+                _render_bed(camera.get_view_matrix(), camera.get_projection_matrix(), !camera.is_looking_downward(), m_show_world_axes);
+                m_frame_profiler.mark("bed");
+                _render_platelist(camera.get_view_matrix(), camera.get_projection_matrix(), !camera.is_looking_downward(), only_current, true, hover_id);
+                m_frame_profiler.mark("plates");
+            }
+            // Realistic view: the print casts a shadow onto the plate here as it does in View3D.
+            _render_shadows(camera.get_view_matrix(), camera.get_projection_matrix());
+            m_frame_profiler.mark("shadows");
+            // BBS: GUI refactor: add canvas size as parameters
+            _render_gcode(cnv_size.get_width(), cnv_size.get_height());
+            m_frame_profiler.mark("gcode");
+        }
     }
     /* assemble render*/
     else if (m_canvas_type == ECanvasType::CanvasAssembleView) {
@@ -2882,7 +2917,9 @@ void GLCanvas3D::_render_scene(const Camera& camera, const Size& cnv_size)
         m_rectangle_selection.render(*this);
     m_frame_profiler.mark("gizmos");
 
-    if (_is_ssao_enabled()) {
+    const bool pathtraced_active = m_pathtraced_view &&
+        (m_canvas_type == ECanvasType::CanvasView3D || m_canvas_type == ECanvasType::CanvasPreview);
+    if (!pathtraced_active && _is_ssao_enabled()) {
         _render_ssao_pass(static_cast<unsigned int>(cnv_size.get_width()), static_cast<unsigned int>(cnv_size.get_height()));
         m_frame_profiler.mark("ssao");
     }
@@ -2890,7 +2927,10 @@ void GLCanvas3D::_render_scene(const Camera& camera, const Size& cnv_size)
     // After the occlusion pass, which would shade it as the surface behind it.
     m_center_of_mass.render(*this);
 
-    if (_is_fxaa_enabled()) {
+    // After the occlusion pass, which would shade it as the surface behind it.
+    m_center_of_mass.render(*this);
+
+    if (!pathtraced_active && _is_fxaa_enabled()) {
         _render_fxaa_pass(static_cast<unsigned int>(cnv_size.get_width()), static_cast<unsigned int>(cnv_size.get_height()));
         m_frame_profiler.mark("fxaa");
     }
@@ -2904,6 +2944,715 @@ void GLCanvas3D::_render_scene(const Camera& camera, const Size& cnv_size)
 
     _capture_scene_cache(camera);
     m_frame_profiler.mark("cache");
+}
+
+bool GLCanvas3D::_render_pathtraced_view(const Camera& source_camera, const Size& canvas_size)
+{
+    size_t scene_signature = 0;
+    const auto combine_scene = [&scene_signature](size_t value) {
+        scene_signature ^= value + size_t(0x9e3779b9) + (scene_signature << 6) + (scene_signature >> 2);
+    };
+    const auto hash_matrix_scene = [&combine_scene](const Transform3d& matrix) {
+        const auto& coefficients = matrix.matrix();
+        for (Eigen::Index i = 0; i < coefficients.size(); ++i)
+            combine_scene(std::hash<double>{}(coefficients.data()[i]));
+    };
+
+    const std::vector<ColorRGBA> extruder_colors =
+        (wxGetApp().plater() != nullptr) ? wxGetApp().plater()->get_extruders_colors() : std::vector<ColorRGBA>{};
+    const auto to_linear_albedo = [](float r, float g, float b) -> Vec3f {
+        const auto channel = [](float c) -> float {
+            return std::clamp(c, 0.0f, 1.0f);
+        };
+        return Vec3f{channel(r), channel(g), channel(b)};
+    };
+    const auto extruder_albedo = [&](int extruder_id, const GLVolume* vol) -> Vec3f {
+        if (!extruder_colors.empty() && extruder_id > 0) {
+            const int idx = std::clamp(extruder_id - 1, 0, int(extruder_colors.size()) - 1);
+            const ColorRGBA& c = extruder_colors[size_t(idx)];
+            return to_linear_albedo(c.r(), c.g(), c.b());
+        }
+        if (vol != nullptr)
+            return to_linear_albedo(vol->color.r(), vol->color.g(), vol->color.b());
+        if (!extruder_colors.empty()) {
+            const ColorRGBA& c = extruder_colors.front();
+            return to_linear_albedo(c.r(), c.g(), c.b());
+        }
+        return Vec3f{0.75f, 0.77f, 0.80f};
+    };
+
+    combine_scene(size_t(m_canvas_type));
+    float preview_z_min = -1e10f;
+    float preview_z_max = 1e10f;
+    size_t preview_color_signature = 0;
+    const auto combine_color = [&preview_color_signature](size_t value) {
+        preview_color_signature ^= value + size_t(0x9e3779b9) + (preview_color_signature << 6) + (preview_color_signature >> 2);
+    };
+    for (const ColorRGBA& c : extruder_colors) {
+        combine_color(std::hash<float>{}(c.r()));
+        combine_color(std::hash<float>{}(c.g()));
+        combine_color(std::hash<float>{}(c.b()));
+    }
+
+    PartPlateList& plate_list = wxGetApp().plater()->get_partplate_list();
+    PartPlate* current_plate = plate_list.get_curr_plate();
+    const bool plate_visible = is_bed_visible() && current_plate != nullptr;
+    combine_scene(size_t(plate_visible));
+    if (plate_visible) {
+        combine_scene(size_t(plate_list.get_plate_count()));
+        for (const Vec2d& point : current_plate->get_shape()) {
+            combine_scene(std::hash<double>{}(point.x()));
+            combine_scene(std::hash<double>{}(point.y()));
+        }
+    }
+
+    if (m_canvas_type == ECanvasType::CanvasPreview) {
+        combine_color(size_t(m_gcode_viewer.get_view_type()));
+        combine_scene(m_gcode_viewer.get_vertices_count());
+        combine_scene(m_gcode_viewer.get_layers_count());
+        const BoundingBoxf3& gcode_bb = m_gcode_viewer.get_paths_bounding_box();
+        for (double v : {gcode_bb.min.x(), gcode_bb.min.y(), gcode_bb.min.z(), gcode_bb.max.x(), gcode_bb.max.y(), gcode_bb.max.z()})
+            combine_scene(std::hash<double>{}(v));
+        for (size_t r = 0; r < libvgcode::GCODE_EXTRUSION_ROLES_COUNT; ++r)
+            combine_scene(size_t(m_gcode_viewer.is_extrusion_role_visible(libvgcode::EGCodeExtrusionRole(r))));
+        if (m_gcode_viewer.has_data() && m_gcode_viewer.get_vertices_count() > 0) {
+            const libvgcode::Interval full_range = m_gcode_viewer.get_gcode_view_full_range();
+            const libvgcode::Interval enabled_range = m_gcode_viewer.get_gcode_view_enabled_range();
+            const libvgcode::Interval visible_range = m_gcode_viewer.get_gcode_view_visible_range();
+            const size_t range_start = (visible_range[0] > enabled_range[0]) ? visible_range[0] : full_range[0];
+            const size_t range_end = visible_range[1];
+            if (range_end > range_start) {
+                const uint32_t min_layer_id = m_gcode_viewer.get_gcode_vertex_at(range_start).layer_id;
+                const uint32_t max_layer_id = m_gcode_viewer.get_gcode_vertex_at(range_end).layer_id;
+                const std::vector<double> layer_zs = m_gcode_viewer.get_layers_zs();
+                if (!layer_zs.empty()) {
+                    const size_t min_idx = std::min<size_t>(min_layer_id, layer_zs.size() - 1);
+                    const size_t max_idx = std::min<size_t>(max_layer_id, layer_zs.size() - 1);
+                    preview_z_min = (min_idx > 0) ? float(0.5 * (layer_zs[min_idx - 1] + layer_zs[min_idx])) : -1.0f;
+                    preview_z_max = (max_idx + 1 < layer_zs.size())
+                        ? float(0.5 * (layer_zs[max_idx] + layer_zs[max_idx + 1]))
+                        : float(layer_zs[max_idx] + 1.0);
+                }
+            }
+        }
+    } else if (m_model != nullptr) {
+        for (const ColorRGBA& c : extruder_colors) {
+            combine_scene(std::hash<float>{}(c.r()));
+            combine_scene(std::hash<float>{}(c.g()));
+            combine_scene(std::hash<float>{}(c.b()));
+        }
+        combine_scene(m_model->objects.size());
+        for (const GLVolume* volume : m_volumes.volumes) {
+            if (volume == nullptr)
+                continue;
+            combine_scene(volume->geometry_id.first);
+            combine_scene(volume->geometry_id.second);
+            combine_scene(volume->model.vertices_count());
+            combine_scene(volume->model.indices_count());
+            combine_scene(size_t(volume->is_active));
+            combine_scene(size_t(volume->extruder_id));
+            hash_matrix_scene(volume->world_matrix());
+            const int object_idx = volume->object_idx();
+            const int volume_idx = volume->volume_idx();
+            if (object_idx >= 0 && object_idx < int(m_model->objects.size()) && m_model->objects[object_idx] != nullptr &&
+                volume_idx >= 0 && volume_idx < int(m_model->objects[object_idx]->volumes.size()) &&
+                m_model->objects[object_idx]->volumes[volume_idx] != nullptr) {
+                const ModelVolume* mv = m_model->objects[object_idx]->volumes[volume_idx];
+                combine_scene(size_t(mv->extruder_id()));
+                combine_scene(size_t(mv->mmu_segmentation_facets.timestamp()));
+            }
+        }
+    }
+    if (scene_signature == 0)
+        scene_signature = 1;
+    if (preview_color_signature == 0)
+        preview_color_signature = 1;
+
+    static PathTraceGpuScene s_cached_gpu_scene;
+    static std::vector<size_t> s_cached_gpu_tri_vertex_id;
+    static size_t s_cached_preview_color_signature = 0;
+
+    if (scene_signature != m_pathtrace_scene_signature) {
+        m_pathtrace_scene_triangles.clear();
+        s_cached_gpu_tri_vertex_id.clear();
+        const auto append_volumes = [&](const GLVolumePtrs& volumes) {
+            if (m_model == nullptr)
+                return;
+            for (const GLVolume* volume : volumes) {
+                if (volume == nullptr || !volume->is_active || volume->is_modifier || volume->is_wipe_tower)
+                    continue;
+                const int object_idx = volume->object_idx();
+                const int volume_idx = volume->volume_idx();
+                if (object_idx < 0 || object_idx >= int(m_model->objects.size()))
+                    continue;
+                const ModelObject* object = m_model->objects[object_idx];
+                if (object == nullptr || volume_idx < 0 || volume_idx >= int(object->volumes.size()))
+                    continue;
+                const ModelVolume* model_volume = object->volumes[volume_idx];
+                if (model_volume == nullptr || model_volume->mesh().its.indices.empty())
+                    continue;
+                const int base_extruder = model_volume->extruder_id() > 0 ? model_volume->extruder_id() : volume->extruder_id;
+                if (!model_volume->mmu_segmentation_facets.empty()) {
+                    std::vector<indexed_triangle_set> its_per_color;
+                    model_volume->mmu_segmentation_facets.get_facets(*model_volume, its_per_color);
+                    for (size_t color_idx = 0; color_idx < its_per_color.size(); ++color_idx) {
+                        if (its_per_color[color_idx].indices.empty())
+                            continue;
+                        const int ext_id = (color_idx == 0) ? base_extruder : int(color_idx);
+                        append_path_trace_triangles(m_pathtrace_scene_triangles,
+                                                    its_per_color[color_idx].vertices,
+                                                    its_per_color[color_idx].indices,
+                                                    volume->world_matrix(),
+                                                    extruder_albedo(ext_id, volume));
+                    }
+                } else {
+                    append_path_trace_triangles(m_pathtrace_scene_triangles,
+                                                model_volume->mesh().its.vertices,
+                                                model_volume->mesh().its.indices,
+                                                volume->world_matrix(),
+                                                extruder_albedo(base_extruder, volume));
+                }
+            }
+        };
+
+        std::vector<size_t> source_tri_vertex_id;
+        std::vector<float> source_tri_tag_z;
+        if (m_canvas_type == ECanvasType::CanvasPreview) {
+            if (m_gcode_viewer.has_data() && m_gcode_viewer.get_vertices_count() > 1) {
+                struct ToolpathSegment
+                {
+                    Vec3f p0;
+                    Vec3f p1;
+                    float width;
+                    float height;
+                    size_t vertex_id;
+                    libvgcode::EGCodeExtrusionRole role;
+                };
+                std::vector<ToolpathSegment> segments;
+                const size_t total_vertices = m_gcode_viewer.get_vertices_count();
+                segments.reserve(std::min<size_t>(220000, total_vertices));
+                for (size_t i = 0; i + 1 < total_vertices; ++i) {
+                    const libvgcode::PathVertex& curr = m_gcode_viewer.get_gcode_vertex_at(i);
+                    const libvgcode::PathVertex& next = m_gcode_viewer.get_gcode_vertex_at(i + 1);
+                    if (!curr.is_extrusion() || !next.is_extrusion() || next.width <= 0.0f || next.height <= 0.0f)
+                        continue;
+                    if (!m_gcode_viewer.is_extrusion_role_visible(next.role))
+                        continue;
+                    const float z_shift = 0.5f * next.height;
+                    const Vec3f p0{curr.position[0], curr.position[1], curr.position[2] - z_shift};
+                    const Vec3f p1{next.position[0], next.position[1], next.position[2] - z_shift};
+                    const Vec3f delta = p1 - p0;
+                    const float curr_len_sq = delta.squaredNorm();
+                    if (curr_len_sq < 1e-8f)
+                        continue;
+                    const float curr_len = std::sqrt(curr_len_sq);
+                    constexpr float max_merged_len = 6.0f;
+                    constexpr float max_piece_len = 8.0f;
+                    if (!segments.empty() && curr_len < max_merged_len) {
+                        ToolpathSegment& prev = segments.back();
+                        const libvgcode::PathVertex& prev_v = m_gcode_viewer.get_gcode_vertex_at(prev.vertex_id);
+                        if (prev_v.extruder_id == next.extruder_id &&
+                            prev.role == next.role &&
+                            std::abs(prev.width - next.width) < 1e-3f &&
+                            std::abs(prev.height - next.height) < 1e-3f &&
+                            std::abs(prev_v.feedrate - next.feedrate) < 0.5f &&
+                            std::abs(prev_v.temperature - next.temperature) < 0.5f &&
+                            std::abs(prev_v.fan_speed - next.fan_speed) < 0.5f &&
+                            (prev.p1 - p0).squaredNorm() < 1e-6f) {
+                            const Vec3f prev_vec = prev.p1 - prev.p0;
+                            const float prev_len = prev_vec.norm();
+                            if (prev_len > 1e-5f && (prev_len + curr_len) <= max_merged_len) {
+                                const Vec3f prev_dir = prev_vec / prev_len;
+                                const Vec3f curr_dir = delta / curr_len;
+                                if (prev_dir.dot(curr_dir) > 0.99995f) {
+                                    const Vec3f total_dir = (p1 - prev.p0).normalized();
+                                    const float perp_dist_sq = ((prev.p1 - prev.p0) - (prev.p1 - prev.p0).dot(total_dir) * total_dir).squaredNorm();
+                                    if (perp_dist_sq < 1e-6f) {
+                                        prev.p1 = p1;
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if (curr_len > max_piece_len) {
+                        const int pieces = std::min(64, int(std::ceil(curr_len / max_piece_len)));
+                        const Vec3f step = delta * (1.0f / float(pieces));
+                        Vec3f sub_p0 = p0;
+                        for (int p = 0; p < pieces; ++p) {
+                            const Vec3f sub_p1 = (p + 1 == pieces) ? p1 : (p0 + step * float(p + 1));
+                            segments.push_back(ToolpathSegment{sub_p0, sub_p1, next.width, next.height, i + 1, next.role});
+                            sub_p0 = sub_p1;
+                        }
+                    } else {
+                        segments.push_back(ToolpathSegment{p0, p1, next.width, next.height, i + 1, next.role});
+                    }
+                }
+                m_pathtrace_scene_triangles.reserve(segments.size() * 8 + 16);
+                source_tri_vertex_id.reserve(segments.size() * 8 + 16);
+                source_tri_tag_z.reserve(segments.size() * 8 + 16);
+                const auto compute_axes = [](const Vec3f& a, const Vec3f& b, Vec3f& dir, Vec3f& right, Vec3f& up) {
+                    dir = (b - a).normalized();
+                    right = dir.cross(Vec3f::UnitZ());
+                    if (right.squaredNorm() < 1e-6f)
+                        right = dir.cross(Vec3f::UnitX());
+                    right.normalize();
+                    up = right.cross(dir).normalized();
+                };
+                for (size_t idx = 0; idx < segments.size(); ++idx) {
+                    const ToolpathSegment& seg = segments[idx];
+                    Vec3f dir, right0, up0;
+                    compute_axes(seg.p0, seg.p1, dir, right0, up0);
+                    Vec3f right1 = right0;
+                    Vec3f up1 = up0;
+                    if (idx > 0) {
+                        const ToolpathSegment& prev = segments[idx - 1];
+                        if ((seg.p0 - prev.p1).squaredNorm() < 1e-5f && std::abs(seg.p0.z() - prev.p1.z()) < 1e-3f) {
+                            Vec3f prev_dir, prev_right, prev_up;
+                            compute_axes(prev.p0, prev.p1, prev_dir, prev_right, prev_up);
+                            if (prev_dir.dot(dir) > -0.25f) {
+                                const Vec3f sum_r = prev_right + right0;
+                                if (sum_r.squaredNorm() > 1e-4f) {
+                                    right0 = sum_r.normalized();
+                                    const float cos_half = std::clamp(right0.dot(prev_right), 0.7071f, 1.0f);
+                                    right0 /= cos_half;
+                                }
+                            }
+                        }
+                    }
+                    if (idx + 1 < segments.size()) {
+                        const ToolpathSegment& nxt = segments[idx + 1];
+                        if ((nxt.p0 - seg.p1).squaredNorm() < 1e-5f && std::abs(nxt.p0.z() - seg.p1.z()) < 1e-3f) {
+                            Vec3f nxt_dir, nxt_right, nxt_up;
+                            compute_axes(nxt.p0, nxt.p1, nxt_dir, nxt_right, nxt_up);
+                            if (dir.dot(nxt_dir) > -0.25f) {
+                                const Vec3f sum_r = right1 + nxt_right;
+                                if (sum_r.squaredNorm() > 1e-4f) {
+                                    right1 = sum_r.normalized();
+                                    const float cos_half = std::clamp(right1.dot(nxt_right), 0.7071f, 1.0f);
+                                    right1 /= cos_half;
+                                }
+                            }
+                        }
+                    }
+                    const Vec3f w0 = 0.5f * seg.width * right0;
+                    const Vec3f h0 = 0.5f * seg.height * up0;
+                    const Vec3f w1 = 0.5f * seg.width * right1;
+                    const Vec3f h1 = 0.5f * seg.height * up1;
+                    const Vec3f r0 = seg.p0 + w0;
+                    const Vec3f t0 = seg.p0 + h0;
+                    const Vec3f l0 = seg.p0 - w0;
+                    const Vec3f b0 = seg.p0 - h0;
+                    const Vec3f r1 = seg.p1 + w1;
+                    const Vec3f t1 = seg.p1 + h1;
+                    const Vec3f l1 = seg.p1 - w1;
+                    const Vec3f b1 = seg.p1 - h1;
+                    const float seg_z = 0.5f * (seg.p0.z() + seg.p1.z()) + 0.5f * seg.height;
+                    const Vec3f albedo{0.62f, 0.64f, 0.67f};
+                    const auto add_quad = [&](const Vec3f& v0, const Vec3f& v1, const Vec3f& v2, const Vec3f& v3) {
+                        m_pathtrace_scene_triangles.push_back(PathTraceTriangle{v0, v1, v2, albedo});
+                        source_tri_vertex_id.push_back(seg.vertex_id);
+                        source_tri_tag_z.push_back(seg_z);
+                        m_pathtrace_scene_triangles.push_back(PathTraceTriangle{v0, v2, v3, albedo});
+                        source_tri_vertex_id.push_back(seg.vertex_id);
+                        source_tri_tag_z.push_back(seg_z);
+                    };
+                    add_quad(r0, r1, t1, t0);
+                    add_quad(t0, t1, l1, l0);
+                    add_quad(l0, l1, b1, b0);
+                    add_quad(b0, b1, r1, r0);
+                }
+            }
+            if (m_pathtrace_scene_triangles.empty())
+                append_volumes(m_gcode_viewer.m_shells.volumes.volumes);
+        } else if (m_model != nullptr) {
+            append_volumes(m_volumes.volumes);
+            if (m_pathtrace_scene_triangles.empty()) {
+                for (const ModelObject* object : m_model->objects) {
+                    const TriangleMesh mesh = object->raw_mesh();
+                    if (mesh.its.indices.empty())
+                        continue;
+                    const Vec3f albedo = extruder_albedo(1, nullptr);
+                    for (const ModelInstance* instance : object->instances) {
+                        append_path_trace_triangles(m_pathtrace_scene_triangles,
+                                                    mesh.its.vertices,
+                                                    mesh.its.indices,
+                                                    instance->get_transformation().get_matrix(),
+                                                    albedo);
+                    }
+                }
+            }
+        }
+
+        if (!m_pathtrace_scene_triangles.empty() && plate_visible) {
+            const auto add_plate_mesh = [&](PartPlate* plate) {
+                if (plate == nullptr)
+                    return;
+                const ExPolygon plate_polygon(Polygon::new_scale(plate->get_shape()));
+                const std::vector<Vec3d> plate_surface = triangulate_expolygon_3d(plate_polygon, -0.03f, NORMALS_UP);
+                const Vec3f plate_marker{-2.0f, 0.42f, 0.48f};
+                for (size_t i = 0; i + 2 < plate_surface.size(); i += 3) {
+                    PathTraceTriangle triangle;
+                    triangle.a = plate_surface[i].cast<float>();
+                    triangle.b = plate_surface[i + 1].cast<float>();
+                    triangle.c = plate_surface[i + 2].cast<float>();
+                    triangle.albedo = plate_marker;
+                    m_pathtrace_scene_triangles.push_back(std::move(triangle));
+                    if (!source_tri_vertex_id.empty()) {
+                        source_tri_vertex_id.push_back(SIZE_MAX);
+                        source_tri_tag_z.push_back(-2.0f);
+                    }
+                }
+            };
+            if (m_canvas_type == ECanvasType::CanvasView3D) {
+                for (size_t p_idx = 0; p_idx < plate_list.get_plate_count(); ++p_idx)
+                    add_plate_mesh(plate_list.get_plate(int(p_idx)));
+            } else {
+                add_plate_mesh(current_plate);
+            }
+        }
+
+        if (!source_tri_vertex_id.empty()) {
+            for (size_t i = 0; i < m_pathtrace_scene_triangles.size(); ++i)
+                m_pathtrace_scene_triangles[i].albedo.x() = float(i);
+        }
+        s_cached_gpu_scene = build_path_trace_gpu_scene(m_pathtrace_scene_triangles);
+        if (!source_tri_vertex_id.empty()) {
+            s_cached_gpu_tri_vertex_id.resize(s_cached_gpu_scene.triangles.size(), SIZE_MAX);
+            for (size_t i = 0; i < s_cached_gpu_scene.triangles.size(); ++i) {
+                const size_t src_idx = size_t(std::lround(s_cached_gpu_scene.triangles[i].albedo[0]));
+                if (src_idx < source_tri_vertex_id.size()) {
+                    s_cached_gpu_tri_vertex_id[i] = source_tri_vertex_id[src_idx];
+                    s_cached_gpu_scene.triangles[i].a[3] = source_tri_tag_z[src_idx];
+                    if (source_tri_vertex_id[src_idx] == SIZE_MAX) {
+                        s_cached_gpu_scene.triangles[i].albedo = {0.38f, 0.42f, 0.48f, 1.0f};
+                    }
+                }
+            }
+        } else {
+            for (auto& tri : s_cached_gpu_scene.triangles) {
+                if (tri.albedo[0] < -1.0f) {
+                    tri.a[3] = -2.0f;
+                    tri.albedo = {0.38f, 0.42f, 0.48f, 1.0f};
+                } else {
+                    tri.a[3] = -1.0f;
+                }
+            }
+        }
+        s_cached_preview_color_signature = 0;
+        m_pathtrace_scene_signature = scene_signature;
+    }
+
+    if (m_pathtrace_scene_triangles.empty())
+        return false;
+
+    if (m_canvas_type == ECanvasType::CanvasPreview &&
+        !s_cached_gpu_tri_vertex_id.empty() &&
+        s_cached_preview_color_signature != preview_color_signature) {
+        const libvgcode::EViewType view_type = m_gcode_viewer.get_view_type();
+        const bool use_extruder_color =
+            view_type == libvgcode::EViewType::Summary ||
+            view_type == libvgcode::EViewType::Tool ||
+            view_type == libvgcode::EViewType::ColorPrint;
+        for (size_t i = 0; i < s_cached_gpu_scene.triangles.size(); ++i) {
+            const size_t v_id = s_cached_gpu_tri_vertex_id[i];
+            if (v_id == SIZE_MAX)
+                continue;
+            const libvgcode::PathVertex& v = m_gcode_viewer.get_gcode_vertex_at(v_id);
+            Vec3f albedo;
+            if (use_extruder_color) {
+                albedo = extruder_albedo(int(v.extruder_id) + 1, nullptr);
+            } else {
+                const libvgcode::Color c = m_gcode_viewer.get_gcode_vertex_color(v);
+                albedo = to_linear_albedo(float(c[0]) / 255.0f, float(c[1]) / 255.0f, float(c[2]) / 255.0f);
+            }
+            s_cached_gpu_scene.triangles[i].albedo = {albedo.x(), albedo.y(), albedo.z(), 1.0f};
+        }
+        if (m_pathtrace_gpu_triangle_buffer != 0 && m_pathtrace_gpu_scene_signature == m_pathtrace_scene_signature) {
+            glsafe(::glBindBuffer(GL_SHADER_STORAGE_BUFFER, m_pathtrace_gpu_triangle_buffer));
+            glsafe(::glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
+                                     s_cached_gpu_scene.triangles.size() * sizeof(PathTraceGpuTriangle),
+                                     s_cached_gpu_scene.triangles.data()));
+            glsafe(::glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0));
+        }
+        s_cached_preview_color_signature = preview_color_signature;
+    }
+
+    size_t signature = scene_signature;
+    const auto combine = [&signature](size_t value) {
+        signature ^= value + size_t(0x9e3779b9) + (signature << 6) + (signature >> 2);
+    };
+    const auto hash_matrix = [&combine](const Transform3d& matrix) {
+        const auto& coefficients = matrix.matrix();
+        for (Eigen::Index i = 0; i < coefficients.size(); ++i)
+            combine(std::hash<double>{}(coefficients.data()[i]));
+    };
+    combine(preview_color_signature);
+    combine(std::hash<float>{}(preview_z_min));
+    combine(std::hash<float>{}(preview_z_max));
+    hash_matrix(source_camera.get_view_matrix());
+    hash_matrix(source_camera.get_projection_matrix());
+    combine(size_t(canvas_size.get_width()));
+    combine(size_t(canvas_size.get_height()));
+    if (signature == 0)
+        signature = 1;
+
+    static std::chrono::steady_clock::time_point s_last_change_time{};
+    const auto now_tp = std::chrono::steady_clock::now();
+    if (signature != m_pathtrace_requested_signature) {
+        if (m_pathtrace_requested_signature != 0)
+            s_last_change_time = now_tp;
+        m_pathtrace_requested_signature = signature;
+        m_pathtrace_cancel.store(true, std::memory_order_relaxed);
+        m_pathtrace_texture.reset();
+        m_pathtrace_gpu_samples = 0;
+    }
+    const bool recent_change = std::chrono::duration_cast<std::chrono::milliseconds>(now_tp - s_last_change_time).count() < 150;
+    const bool interactive = m_camera_movement || m_mouse.dragging || m_gizmos.is_dragging() || ImGui::IsMouseDown(0) || recent_change;
+
+    bool can_use_gpu = false;
+    GLShaderProgram* compute_shader = nullptr;
+#if !SLIC3R_OPENGL_ES
+    if (OpenGLManager::get_gl_info().is_version_greater_or_equal_to(4, 3)) {
+        compute_shader = wxGetApp().get_shader("pathtrace_compute");
+        if (compute_shader != nullptr)
+            can_use_gpu = true;
+    }
+#endif // !SLIC3R_OPENGL_ES
+
+    if (can_use_gpu) {
+        if (m_pathtrace_thread.joinable()) {
+            m_pathtrace_cancel.store(true, std::memory_order_relaxed);
+            m_pathtrace_thread.join();
+        }
+
+        if (m_pathtrace_gpu_scene_signature != m_pathtrace_scene_signature) {
+            if (m_pathtrace_gpu_node_buffer == 0)
+                glsafe(::glGenBuffers(1, &m_pathtrace_gpu_node_buffer));
+            glsafe(::glBindBuffer(GL_SHADER_STORAGE_BUFFER, m_pathtrace_gpu_node_buffer));
+            glsafe(::glBufferData(GL_SHADER_STORAGE_BUFFER,
+                                  s_cached_gpu_scene.nodes.size() * sizeof(PathTraceGpuNode),
+                                  s_cached_gpu_scene.nodes.data(),
+                                  GL_STATIC_DRAW));
+
+            if (m_pathtrace_gpu_triangle_buffer == 0)
+                glsafe(::glGenBuffers(1, &m_pathtrace_gpu_triangle_buffer));
+            glsafe(::glBindBuffer(GL_SHADER_STORAGE_BUFFER, m_pathtrace_gpu_triangle_buffer));
+            glsafe(::glBufferData(GL_SHADER_STORAGE_BUFFER,
+                                  s_cached_gpu_scene.triangles.size() * sizeof(PathTraceGpuTriangle),
+                                  s_cached_gpu_scene.triangles.data(),
+                                  GL_DYNAMIC_DRAW));
+            glsafe(::glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0));
+
+            m_pathtrace_gpu_scene_signature = m_pathtrace_scene_signature;
+        }
+
+        const uint32_t full_width = uint32_t(std::max(1, canvas_size.get_width()));
+        const uint32_t full_height = uint32_t(std::max(1, canvas_size.get_height()));
+        const uint32_t max_render_dim = interactive ? 720u : 1440u;
+        const float max_scale_cap = interactive ? 0.55f : 1.0f;
+        const uint32_t max_full_dim = std::max(full_width, full_height);
+        const float res_scale = max_full_dim > max_render_dim
+            ? std::min(max_scale_cap, float(max_render_dim) / float(max_full_dim))
+            : max_scale_cap;
+        const uint32_t render_width = std::max(1u, uint32_t(std::lround(float(full_width) * res_scale)));
+        const uint32_t render_height = std::max(1u, uint32_t(std::lround(float(full_height) * res_scale)));
+
+        if (m_pathtrace_gpu_accumulation_image == 0 ||
+            m_pathtrace_gpu_display_image == 0 ||
+            m_pathtrace_gpu_image_size[0] != render_width ||
+            m_pathtrace_gpu_image_size[1] != render_height) {
+
+            glsafe(::glActiveTexture(GL_TEXTURE0));
+            if (m_pathtrace_gpu_accumulation_image == 0)
+                glsafe(::glGenTextures(1, &m_pathtrace_gpu_accumulation_image));
+            glsafe(::glBindTexture(GL_TEXTURE_2D, m_pathtrace_gpu_accumulation_image));
+            glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST));
+            glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST));
+            glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE));
+            glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE));
+            glsafe(::glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, render_width, render_height, 0, GL_RGBA, GL_FLOAT, nullptr));
+
+            if (m_pathtrace_gpu_display_image == 0)
+                glsafe(::glGenTextures(1, &m_pathtrace_gpu_display_image));
+            glsafe(::glBindTexture(GL_TEXTURE_2D, m_pathtrace_gpu_display_image));
+            glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR));
+            glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR));
+            glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE));
+            glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE));
+            glsafe(::glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, render_width, render_height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr));
+            glsafe(::glBindTexture(GL_TEXTURE_2D, 0));
+
+            m_pathtrace_gpu_image_size = {render_width, render_height};
+            m_pathtrace_gpu_samples = 0;
+        }
+
+        constexpr uint32_t max_gpu_samples = 2048u;
+        const uint32_t target_max_samples = interactive ? 1u : max_gpu_samples;
+        if (m_pathtrace_gpu_samples < target_max_samples) {
+            const uint32_t batch_samples = 1u;
+
+            PathTraceCamera camera;
+            camera.position = source_camera.get_position().cast<float>();
+            camera.right = source_camera.get_dir_right().cast<float>();
+            camera.up = source_camera.get_dir_up().cast<float>();
+            camera.forward = source_camera.get_dir_forward().cast<float>();
+            camera.orthographic = source_camera.get_type() == Camera::EType::Ortho;
+            if (camera.orthographic)
+                camera.orthographic_height = float(source_camera.get_near_height());
+            else
+                camera.vertical_fov_degrees = float(source_camera.get_fov());
+
+            glsafe(::glBindImageTexture(0, m_pathtrace_gpu_accumulation_image, 0, GL_FALSE, 0, GL_READ_WRITE, GL_RGBA32F));
+            glsafe(::glBindImageTexture(1, m_pathtrace_gpu_display_image, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8));
+
+            glsafe(::glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, m_pathtrace_gpu_node_buffer));
+            glsafe(::glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, m_pathtrace_gpu_triangle_buffer));
+
+            const Vec3f camera_right = camera.right.normalized();
+            const Vec3f camera_up = camera.up.normalized();
+            const Vec3f camera_forward = camera.forward.normalized();
+            compute_shader->start_using();
+            compute_shader->set_uniform("image_size", std::array<int, 2>{int(render_width), int(render_height)});
+            compute_shader->set_uniform("camera_position", camera.position);
+            compute_shader->set_uniform("camera_right", camera_right);
+            compute_shader->set_uniform("camera_up", camera_up);
+            compute_shader->set_uniform("camera_forward", camera_forward);
+            const float pi = 3.14159265358979323846f;
+            const float half_fov = camera.orthographic ? 0.0f : camera.vertical_fov_degrees * pi / 360.0f;
+            compute_shader->set_uniform("camera_half_fov", half_fov);
+            compute_shader->set_uniform("camera_orthographic_height", camera.orthographic_height);
+            compute_shader->set_uniform("camera_orthographic", camera.orthographic);
+            compute_shader->set_uniform("sample_start", int(m_pathtrace_gpu_samples));
+            compute_shader->set_uniform("sample_count", int(batch_samples));
+            compute_shader->set_uniform("max_bounces", 2);
+            compute_shader->set_uniform("z_min", preview_z_min);
+            compute_shader->set_uniform("z_max", preview_z_max);
+
+            const GLuint groups_x = (render_width + 7) / 8;
+            const GLuint groups_y = (render_height + 7) / 8;
+            glsafe(::glDispatchCompute(groups_x, groups_y, 1));
+            glsafe(::glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT));
+            compute_shader->stop_using();
+
+            glsafe(::glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, 0));
+            glsafe(::glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, 0));
+
+            m_pathtrace_gpu_samples += batch_samples;
+            if (!interactive && m_pathtrace_gpu_samples < max_gpu_samples) {
+                schedule_extra_frame(12);
+            } else if (recent_change) {
+                schedule_extra_frame(80);
+            }
+        } else if (recent_change) {
+            schedule_extra_frame(80);
+        }
+
+        if (m_pathtrace_gpu_display_image != 0) {
+            glsafe(::glActiveTexture(GL_TEXTURE0));
+            glsafe(::glDisable(GL_DEPTH_TEST));
+            GLTexture::render_texture(m_pathtrace_gpu_display_image, -1.0f, 1.0f, -1.0f, 1.0f);
+            glsafe(::glEnable(GL_DEPTH_TEST));
+            return true;
+        }
+        return false;
+    }
+
+    if (m_pathtrace_complete.load(std::memory_order_acquire)) {
+        if (m_pathtrace_thread.joinable())
+            m_pathtrace_thread.join();
+        m_pathtrace_complete.store(false, std::memory_order_relaxed);
+    }
+
+    const uint64_t preview_revision = m_pathtrace_preview_revision.load(std::memory_order_acquire);
+    if (preview_revision != m_pathtrace_displayed_revision) {
+        PathTraceImage preview;
+        size_t preview_signature = 0;
+        {
+            std::lock_guard<std::mutex> lock(m_pathtrace_result_mutex);
+            preview = m_pathtrace_result;
+            preview_signature = m_pathtrace_result_signature;
+        }
+        m_pathtrace_displayed_revision = preview_revision;
+        if (preview_signature == m_pathtrace_requested_signature && !preview.canceled && !preview.rgb.empty()) {
+            std::vector<unsigned char> rgba(size_t(preview.width) * preview.height * 4);
+            for (size_t pixel = 0, source = 0; pixel < size_t(preview.width) * preview.height; ++pixel) {
+                rgba[pixel * 4] = preview.rgb[source++];
+                rgba[pixel * 4 + 1] = preview.rgb[source++];
+                rgba[pixel * 4 + 2] = preview.rgb[source++];
+                rgba[pixel * 4 + 3] = 255;
+            }
+            m_pathtrace_texture.reset();
+            m_pathtrace_texture.load_from_raw_data(std::move(rgba), preview.width, preview.height, false, false);
+        }
+    }
+
+    bool pathtrace_result_matches = false;
+    uint32_t completed_samples = 0;
+    {
+        std::lock_guard<std::mutex> lock(m_pathtrace_result_mutex);
+        pathtrace_result_matches = m_pathtrace_result_signature == m_pathtrace_requested_signature;
+        completed_samples = m_pathtrace_result.samples_per_pixel;
+    }
+    if (!m_pathtrace_thread.joinable() && !m_pathtrace_scene_triangles.empty() &&
+        (!pathtrace_result_matches || completed_samples < 128) && !m_camera_movement) {
+        PathTraceCamera camera;
+        camera.position = source_camera.get_position().cast<float>();
+        camera.right = source_camera.get_dir_right().cast<float>();
+        camera.up = source_camera.get_dir_up().cast<float>();
+        camera.forward = source_camera.get_dir_forward().cast<float>();
+        camera.orthographic = source_camera.get_type() == Camera::EType::Ortho;
+        if (camera.orthographic)
+            camera.orthographic_height = float(source_camera.get_near_height());
+        else
+            camera.vertical_fov_degrees = float(source_camera.get_fov());
+
+        PathTraceSettings settings;
+        settings.width = std::min(640u, uint32_t(std::max(1, canvas_size.get_width())));
+        settings.height = std::max(1u, uint32_t(std::lround(double(settings.width) *
+            std::max(1, canvas_size.get_height()) / std::max(1, canvas_size.get_width()))));
+        settings.samples_per_pixel = 128;
+        settings.sample_batch_size = 4;
+        settings.max_bounces = 3;
+        const size_t render_signature = m_pathtrace_requested_signature;
+        m_pathtrace_cancel.store(false, std::memory_order_relaxed);
+        try {
+            m_pathtrace_thread = std::thread([this, triangles = m_pathtrace_scene_triangles, camera, settings, render_signature]() mutable {
+                try {
+                    render_path_traced_image(triangles, camera, settings,
+                        [this] { return m_pathtrace_cancel.load(std::memory_order_relaxed); }, {},
+                        [this, render_signature](const PathTraceImage& preview) {
+                            {
+                                std::lock_guard<std::mutex> lock(m_pathtrace_result_mutex);
+                                m_pathtrace_result = preview;
+                                m_pathtrace_result_signature = render_signature;
+                            }
+                            m_pathtrace_preview_revision.fetch_add(1, std::memory_order_release);
+                        });
+                } catch (...) {
+                    std::lock_guard<std::mutex> lock(m_pathtrace_result_mutex);
+                    m_pathtrace_result = {};
+                    m_pathtrace_result_signature = render_signature;
+                    m_pathtrace_preview_revision.fetch_add(1, std::memory_order_release);
+                }
+                m_pathtrace_complete.store(true, std::memory_order_release);
+            });
+        } catch (const std::exception&) {
+            std::lock_guard<std::mutex> lock(m_pathtrace_result_mutex);
+            m_pathtrace_result_signature = render_signature;
+            return false;
+        }
+    }
+
+    if (m_pathtrace_thread.joinable())
+        schedule_extra_frame(100);
+    if (m_pathtrace_texture.get_id() == 0)
+        return false;
+
+    glsafe(::glDisable(GL_DEPTH_TEST));
+    GLTexture::render_texture(m_pathtrace_texture.get_id(), -1.0f, 1.0f, -1.0f, 1.0f);
+    glsafe(::glEnable(GL_DEPTH_TEST));
+    return true;
 }
 
 void GLCanvas3D::render_thumbnail(ThumbnailData &         thumbnail_data,
@@ -4504,10 +5253,8 @@ void GLCanvas3D::on_timer(wxTimerEvent& evt)
 
 void GLCanvas3D::on_render_timer(wxTimerEvent& evt)
 {
-    // no need to wake up idle
-    // right after this event, idle event is fired
-    // m_dirty = true;
-    // wxWakeUpIdle();
+    m_dirty = true;
+    wxWakeUpIdle();
 }
 
 void GLCanvas3D::on_set_color_timer(wxTimerEvent& evt)
@@ -8425,7 +9172,7 @@ bool GLCanvas3D::_is_realistic_view_enabled() const
 
 bool GLCanvas3D::_is_ssao_enabled() const
 {
-    if (wxGetApp().app_config == nullptr)
+    if (m_pathtraced_view || wxGetApp().app_config == nullptr)
         return false;
     return _is_realistic_view_enabled() &&
            wxGetApp().app_config->get_bool(SETTING_OPENGL_PHONG_SSAO);
@@ -8505,7 +9252,7 @@ bool GLCanvas3D::_is_scene_cache_enabled() const
 
 bool GLCanvas3D::_is_scene_cacheable() const
 {
-    if (!_is_scene_cache_enabled())
+    if (m_pathtraced_view || !_is_scene_cache_enabled())
         return false;
 
 #ifdef SLIC3R_CAD
@@ -11031,6 +11778,18 @@ void GLCanvas3D::_render_canvas_toolbar()
             [&cfg]{
                 cfg->set_bool(SETTING_OPENGL_REALISTIC_MODE, !cfg->get_bool(SETTING_OPENGL_REALISTIC_MODE));
                 cfg->save();
+            }
+        );
+
+        create_menu_item( _utf8(L("Path Traced View")),
+            m_canvas_type == ECanvasType::CanvasView3D || m_canvas_type == ECanvasType::CanvasPreview,
+            m_pathtraced_view,
+            [this]{
+                m_pathtraced_view = !m_pathtraced_view;
+                if (!m_pathtraced_view)
+                    m_pathtrace_cancel.store(true, std::memory_order_relaxed);
+                m_dirty = true;
+                wxWakeUpIdle();
             }
         );
 
