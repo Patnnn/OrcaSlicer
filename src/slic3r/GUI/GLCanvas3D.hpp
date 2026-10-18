@@ -735,7 +735,6 @@ private:
     GLVolumeCollection m_volumes;
     GCodeViewer m_gcode_viewer;
 
-    bool m_pathtraced_view{false};
     GLTexture m_pathtrace_texture;
     std::thread m_pathtrace_thread;
     std::atomic<bool> m_pathtrace_cancel{false};
@@ -1528,6 +1527,7 @@ private:
     void _picking_pass_imex_ghosts();
     bool _is_fxaa_enabled() const;
     bool _is_realistic_view_enabled() const;
+    bool _is_pathtrace_enabled() const;
     bool _is_ssao_enabled() const;
     int _get_effective_fps_cap() const;
     bool _is_fps_overlay_enabled() const;

@@ -290,7 +290,7 @@ vec4 trace_path(Ray ray, inout uint state)
             ao_vis = same_layer_neighbor ? 0.82 : 0.65;
         } else {
             ao_vis = clamp(0.14 + gi_hit.distance * 0.035, 0.14, 0.75);
-            if (gi_hit.tag >= -1.5) {
+            if (gi_hit.tag >= -1.5 && max_bounces > 1) {
                 float bounce_ndl = max(0.20, dot(gi_hit.normal, base_light_dir));
                 indirect_bounce = gi_hit.albedo * (0.08 * bounce_ndl);
             }

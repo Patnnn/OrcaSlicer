@@ -1979,12 +1979,18 @@ void PreferencesDialog::create_items()
     //// GRAPHICS > Realistic view
     g_sizer->Add(create_item_title(_L("Realistic View")), 1, wxEXPAND);
 
-    auto item_realistic_phong = create_item_checkbox(
-        _L("Phong shading"),
-        _L("Uses Phong shading inside realistic view.")
-        , SETTING_OPENGL_REALISTIC_PHONG
-    );
-    g_sizer->Add(item_realistic_phong);
+    std::vector<wxString> ShadingLabels = { _L("Gouraud"),
+                                            _L("Phong"),
+                                            _L("Path tracing") };
+    std::vector<std::string> ShadingValues = { "gouraud", "phong", "pathtrace" };
+    auto item_shading_model = create_item_combobox(
+        _L("Shading model"),
+        _L("Selects the shading technique used when Realistic View is enabled.\n"
+           "Gouraud: classic per-vertex lighting with cast shadows.\n"
+           "Phong: per-pixel lighting with specular highlights, cast shadows, and SSAO.\n"
+           "Path tracing: physically based GPU ray tracing with ambient occlusion and soft shadows."),
+        SETTING_OPENGL_SHADING_MODEL, ShadingLabels, ShadingValues);
+    g_sizer->Add(item_shading_model);
 
     auto item_realistic_preview = create_item_checkbox(
         _L("Enable in Preview"),
@@ -2015,6 +2021,40 @@ void PreferencesDialog::create_items()
            "Orbit: the light turns with the camera, recomputing the shadows every frame the camera moves."),
         SETTING_OPENGL_REALISTIC_SHADOWS, ShadowsLabels, ShadowsValues);
     g_sizer->Add(item_realistic_shadows);
+ 
+    //// GRAPHICS > Path Tracing
+    g_sizer->Add(create_item_title(_L("Path Tracing")), 1, wxEXPAND);
+
+    std::vector<wxString> PtSamplesLabels = { "256", "512", "1024", "2048", "4096" };
+    std::vector<std::string> PtSamplesValues = { "256", "512", "1024", "2048", "4096" };
+    auto item_pt_samples = create_item_combobox(
+        _L("Max samples"),
+        _L("Maximum progressive accumulation samples when the camera is stationary.\n"
+           "Higher samples eliminate noise completely; lower samples finish faster."),
+        SETTING_OPENGL_PATHTRACE_MAX_SAMPLES, PtSamplesLabels, PtSamplesValues);
+    g_sizer->Add(item_pt_samples);
+
+    std::vector<wxString> PtResLabels = { _L("50% (Performance)"), _L("70% (Balanced)"), _L("100% (Native)") };
+    std::vector<std::string> PtResValues = { "50", "70", "100" };
+    auto item_pt_inter_res = create_item_combobox(
+        _L("Interactive resolution"),
+        _L("Resolution scaling used during camera movement, rotation, and zooming.\n"
+           "50%: highest framerate during interaction.\n"
+           "70%: balanced quality and speed.\n"
+           "100%: native resolution (sharpest, but heavier on GPU).\n"
+           "Full resolution is always restored automatically once interaction stops."),
+        SETTING_OPENGL_PATHTRACE_INTERACTIVE_RES, PtResLabels, PtResValues);
+    g_sizer->Add(item_pt_inter_res);
+
+    std::vector<wxString> PtBouncesLabels = { _L("1 bounce (Fast)"), _L("2 bounces (Realistic)") };
+    std::vector<std::string> PtBouncesValues = { "1", "2" };
+    auto item_pt_bounces = create_item_combobox(
+        _L("Light bounces"),
+        _L("Indirect lighting bounces in the path tracer.\n"
+           "1 bounce: direct lighting and ambient occlusion only (fastest).\n"
+           "2 bounces: adds indirect diffuse color bounce (more realistic)."),
+        SETTING_OPENGL_PATHTRACE_BOUNCES, PtBouncesLabels, PtBouncesValues);
+    g_sizer->Add(item_pt_bounces);
 
     //// GRAPHICS > Anti-aliasing
     g_sizer->Add(create_item_title(_L("Anti-aliasing")), 1, wxEXPAND);

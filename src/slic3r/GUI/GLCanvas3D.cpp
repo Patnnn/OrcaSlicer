@@ -2826,7 +2826,7 @@ void GLCanvas3D::_render_scene(const Camera& camera, const Size& cnv_size)
             _render_cad_grid(camera.get_view_matrix(), camera.get_projection_matrix());
         m_frame_profiler.mark("plates");
 
-        if (m_pathtraced_view && _render_pathtraced_view(camera, cnv_size)) {
+        if (_is_pathtrace_enabled() && _render_pathtraced_view(camera, cnv_size)) {
             _render_selection();
             m_frame_profiler.mark("path tracing");
         } else {
@@ -2846,7 +2846,7 @@ void GLCanvas3D::_render_scene(const Camera& camera, const Size& cnv_size)
     /* preview render */
     else if (m_canvas_type == ECanvasType::CanvasPreview && m_render_preview) {
         bool pathtraced_rendered = false;
-        if (m_pathtraced_view) {
+        if (_is_pathtrace_enabled()) {
             _render_bed(camera.get_view_matrix(), camera.get_projection_matrix(), !camera.is_looking_downward(), m_show_world_axes);
             m_frame_profiler.mark("bed");
             _render_platelist(camera.get_view_matrix(), camera.get_projection_matrix(), !camera.is_looking_downward(), only_current, true, hover_id);
@@ -2863,7 +2863,7 @@ void GLCanvas3D::_render_scene(const Camera& camera, const Size& cnv_size)
             _render_sla_slices();
             _render_selection();
             m_frame_profiler.mark("objects");
-            if (!m_pathtraced_view) {
+            if (!_is_pathtrace_enabled()) {
                 _render_bed(camera.get_view_matrix(), camera.get_projection_matrix(), !camera.is_looking_downward(), m_show_world_axes);
                 m_frame_profiler.mark("bed");
                 _render_platelist(camera.get_view_matrix(), camera.get_projection_matrix(), !camera.is_looking_downward(), only_current, true, hover_id);
@@ -2917,8 +2917,7 @@ void GLCanvas3D::_render_scene(const Camera& camera, const Size& cnv_size)
         m_rectangle_selection.render(*this);
     m_frame_profiler.mark("gizmos");
 
-    const bool pathtraced_active = m_pathtraced_view &&
-        (m_canvas_type == ECanvasType::CanvasView3D || m_canvas_type == ECanvasType::CanvasPreview);
+    const bool pathtraced_active = _is_pathtrace_enabled();
     if (!pathtraced_active && _is_ssao_enabled()) {
         _render_ssao_pass(static_cast<unsigned int>(cnv_size.get_width()), static_cast<unsigned int>(cnv_size.get_height()));
         m_frame_profiler.mark("ssao");
@@ -3388,6 +3387,27 @@ bool GLCanvas3D::_render_pathtraced_view(const Camera& source_camera, const Size
             combine(std::hash<double>{}(coefficients.data()[i]));
     };
     combine(preview_color_signature);
+    int cfg_bounces = 2;
+    uint32_t cfg_max_samples = 2048u;
+    float cfg_interactive_scale = 0.50f;
+    if (const AppConfig* cfg = wxGetApp().app_config) {
+        try {
+            const std::string s_smp = cfg->get(SETTING_OPENGL_PATHTRACE_MAX_SAMPLES);
+            if (!s_smp.empty())
+                cfg_max_samples = std::max(64u, uint32_t(std::stoul(s_smp)));
+        } catch (...) {}
+        try {
+            const std::string s_res = cfg->get(SETTING_OPENGL_PATHTRACE_INTERACTIVE_RES);
+            if (!s_res.empty())
+                cfg_interactive_scale = std::clamp(float(std::stoi(s_res)) / 100.0f, 0.25f, 1.0f);
+        } catch (...) {}
+        try {
+            const std::string s_bnc = cfg->get(SETTING_OPENGL_PATHTRACE_BOUNCES);
+            if (!s_bnc.empty())
+                cfg_bounces = std::clamp(std::stoi(s_bnc), 1, 4);
+        } catch (...) {}
+    }
+    combine(size_t(cfg_bounces));
     combine(std::hash<float>{}(preview_z_min));
     combine(std::hash<float>{}(preview_z_max));
     hash_matrix(source_camera.get_view_matrix());
@@ -3449,8 +3469,8 @@ bool GLCanvas3D::_render_pathtraced_view(const Camera& source_camera, const Size
 
         const uint32_t full_width = uint32_t(std::max(1, canvas_size.get_width()));
         const uint32_t full_height = uint32_t(std::max(1, canvas_size.get_height()));
-        const uint32_t max_render_dim = interactive ? 720u : 1440u;
-        const float max_scale_cap = interactive ? 0.55f : 1.0f;
+        const uint32_t max_render_dim = interactive ? uint32_t(std::lround(1440.0f * cfg_interactive_scale)) : 1440u;
+        const float max_scale_cap = interactive ? cfg_interactive_scale : 1.0f;
         const uint32_t max_full_dim = std::max(full_width, full_height);
         const float res_scale = max_full_dim > max_render_dim
             ? std::min(max_scale_cap, float(max_render_dim) / float(max_full_dim))
@@ -3487,8 +3507,7 @@ bool GLCanvas3D::_render_pathtraced_view(const Camera& source_camera, const Size
             m_pathtrace_gpu_samples = 0;
         }
 
-        constexpr uint32_t max_gpu_samples = 2048u;
-        const uint32_t target_max_samples = interactive ? 1u : max_gpu_samples;
+        const uint32_t target_max_samples = interactive ? 1u : cfg_max_samples;
         if (m_pathtrace_gpu_samples < target_max_samples) {
             const uint32_t batch_samples = 1u;
 
@@ -3525,7 +3544,7 @@ bool GLCanvas3D::_render_pathtraced_view(const Camera& source_camera, const Size
             compute_shader->set_uniform("camera_orthographic", camera.orthographic);
             compute_shader->set_uniform("sample_start", int(m_pathtrace_gpu_samples));
             compute_shader->set_uniform("sample_count", int(batch_samples));
-            compute_shader->set_uniform("max_bounces", 2);
+            compute_shader->set_uniform("max_bounces", cfg_bounces);
             compute_shader->set_uniform("z_min", preview_z_min);
             compute_shader->set_uniform("z_max", preview_z_max);
 
@@ -3539,7 +3558,7 @@ bool GLCanvas3D::_render_pathtraced_view(const Camera& source_camera, const Size
             glsafe(::glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, 0));
 
             m_pathtrace_gpu_samples += batch_samples;
-            if (!interactive && m_pathtrace_gpu_samples < max_gpu_samples) {
+            if (!interactive && m_pathtrace_gpu_samples < cfg_max_samples) {
                 schedule_extra_frame(12);
             } else if (recent_change) {
                 schedule_extra_frame(80);
@@ -9170,9 +9189,19 @@ bool GLCanvas3D::_is_realistic_view_enabled() const
     return m_canvas_type != ECanvasType::CanvasPreview || cfg->get_bool(SETTING_OPENGL_REALISTIC_PREVIEW);
 }
 
+bool GLCanvas3D::_is_pathtrace_enabled() const
+{
+    if (!_is_realistic_view_enabled())
+        return false;
+    const AppConfig* cfg = wxGetApp().app_config;
+    if (cfg == nullptr)
+        return false;
+    return cfg->get(SETTING_OPENGL_SHADING_MODEL) == "pathtrace";
+}
+
 bool GLCanvas3D::_is_ssao_enabled() const
 {
-    if (m_pathtraced_view || wxGetApp().app_config == nullptr)
+    if (_is_pathtrace_enabled() || wxGetApp().app_config == nullptr)
         return false;
     return _is_realistic_view_enabled() &&
            wxGetApp().app_config->get_bool(SETTING_OPENGL_PHONG_SSAO);
@@ -9252,7 +9281,7 @@ bool GLCanvas3D::_is_scene_cache_enabled() const
 
 bool GLCanvas3D::_is_scene_cacheable() const
 {
-    if (m_pathtraced_view || !_is_scene_cache_enabled())
+    if (_is_pathtrace_enabled() || !_is_scene_cache_enabled())
         return false;
 
 #ifdef SLIC3R_CAD
@@ -10198,7 +10227,8 @@ void GLCanvas3D::_render_objects(GLVolumeCollection::ERenderType type, bool with
     }
 
     const bool realistic_mode = _is_realistic_view_enabled();
-    const bool realistic_phong = wxGetApp().app_config != nullptr && wxGetApp().app_config->get_bool(SETTING_OPENGL_REALISTIC_PHONG);
+    const std::string shading_model = wxGetApp().app_config != nullptr ? wxGetApp().app_config->get(SETTING_OPENGL_SHADING_MODEL) : "gouraud";
+    const bool realistic_phong = (shading_model == "phong") || (shading_model.empty() && wxGetApp().app_config != nullptr && wxGetApp().app_config->get_bool(SETTING_OPENGL_REALISTIC_PHONG));
     const std::string shader_name = (m_studio_lighting || (realistic_mode && realistic_phong)) ? "phong" : "gouraud";
     GLShaderProgram* shader = wxGetApp().get_shader(shader_name);
     if (shader == nullptr && shader_name != "gouraud")
@@ -11775,18 +11805,11 @@ void GLCanvas3D::_render_canvas_toolbar()
         create_menu_item( _utf8(L("Realistic View")),
             true, // work on all
             cfg->get_bool(SETTING_OPENGL_REALISTIC_MODE),
-            [&cfg]{
-                cfg->set_bool(SETTING_OPENGL_REALISTIC_MODE, !cfg->get_bool(SETTING_OPENGL_REALISTIC_MODE));
+            [this, &cfg]{
+                const bool new_val = !cfg->get_bool(SETTING_OPENGL_REALISTIC_MODE);
+                cfg->set_bool(SETTING_OPENGL_REALISTIC_MODE, new_val);
                 cfg->save();
-            }
-        );
-
-        create_menu_item( _utf8(L("Path Traced View")),
-            m_canvas_type == ECanvasType::CanvasView3D || m_canvas_type == ECanvasType::CanvasPreview,
-            m_pathtraced_view,
-            [this]{
-                m_pathtraced_view = !m_pathtraced_view;
-                if (!m_pathtraced_view)
+                if (!new_val)
                     m_pathtrace_cancel.store(true, std::memory_order_relaxed);
                 m_dirty = true;
                 wxWakeUpIdle();
