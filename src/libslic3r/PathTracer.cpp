@@ -86,7 +86,9 @@ private:
 class Scene
 {
 public:
-    explicit Scene(const std::vector<PathTraceTriangle>& triangles) : m_triangles(triangles)
+    explicit Scene(const std::vector<PathTraceTriangle>& triangles,
+                   const std::array<float, 4>& clipping_plane = {0.0f, 0.0f, 0.0f, 1.0f})
+        : m_triangles(triangles), m_clipping_plane(clipping_plane)
     {
         const size_t n = triangles.size();
         m_indices.resize(n);
@@ -281,8 +283,19 @@ private:
         return node_index;
     }
 
-    static bool intersects_bounds(const Bounds& bounds, const Ray& ray, float max_distance)
+    bool intersects_bounds(const Bounds& bounds, const Ray& ray, float max_distance) const
     {
+        const Vec3f plane_n{m_clipping_plane[0], m_clipping_plane[1], m_clipping_plane[2]};
+        const bool clipping_active = plane_n.squaredNorm() > 0.5f;
+        if (clipping_active && bounds.min.z() >= -0.01f) {
+            const Vec3f p_max{
+                plane_n.x() >= 0.0f ? bounds.max.x() : bounds.min.x(),
+                plane_n.y() >= 0.0f ? bounds.max.y() : bounds.min.y(),
+                plane_n.z() >= 0.0f ? bounds.max.z() : bounds.min.z()
+            };
+            if (plane_n.dot(p_max) + m_clipping_plane[3] < 0.0f)
+                return false;
+        }
         float near_distance = ray_epsilon;
         float far_distance = max_distance;
         for (int axis = 0; axis < 3; ++axis) {
@@ -301,11 +314,31 @@ private:
             if (far_distance < near_distance)
                 return false;
         }
+        if (clipping_active && bounds.min.z() >= -0.01f) {
+            const float denom = plane_n.dot(ray.direction);
+            const float dist = plane_n.dot(ray.origin) + m_clipping_plane[3];
+            if (denom > 1e-5f)
+                near_distance = std::max(near_distance, -dist / denom);
+            else if (denom < -1e-5f)
+                far_distance = std::min(far_distance, -dist / denom);
+            else if (dist < 0.0f)
+                return false;
+            if (far_distance < near_distance)
+                return false;
+        }
         return true;
     }
 
-    static bool intersect_triangle(const PathTraceTriangle& triangle, const Ray& ray, Hit& hit)
+    bool intersect_triangle(const PathTraceTriangle& triangle, const Ray& ray, Hit& hit) const
     {
+        const Vec3f plane_n{m_clipping_plane[0], m_clipping_plane[1], m_clipping_plane[2]};
+        if (triangle.albedo.x() >= -1.0f && plane_n.squaredNorm() > 0.5f) {
+            const float da = plane_n.dot(triangle.a) + m_clipping_plane[3];
+            const float db = plane_n.dot(triangle.b) + m_clipping_plane[3];
+            const float dc = plane_n.dot(triangle.c) + m_clipping_plane[3];
+            if (da < 0.0f && db < 0.0f && dc < 0.0f)
+                return false;
+        }
         const Vec3f edge1 = triangle.b - triangle.a;
         const Vec3f edge2 = triangle.c - triangle.a;
         const Vec3f cross = ray.direction.cross(edge2);
@@ -326,8 +359,12 @@ private:
         if (distance < ray_epsilon || distance >= hit.distance)
             return false;
 
+        const Vec3f hit_pos = ray.origin + ray.direction * distance;
+        if (triangle.albedo.x() >= -1.0f && (plane_n.dot(hit_pos) + m_clipping_plane[3] < 0.0f))
+            return false;
+
         hit.distance = distance;
-        hit.position = ray.origin + ray.direction * distance;
+        hit.position = hit_pos;
         hit.normal = edge1.cross(edge2).normalized();
         if (hit.normal.dot(ray.direction) > 0.0f)
             hit.normal = -hit.normal;
@@ -336,6 +373,7 @@ private:
     }
 
     const std::vector<PathTraceTriangle>& m_triangles;
+    std::array<float, 4> m_clipping_plane{0.0f, 0.0f, 0.0f, 1.0f};
     std::vector<size_t> m_indices;
     std::vector<Bounds> m_prim_bounds;
     std::vector<Vec3f> m_prim_centroids;
@@ -445,7 +483,7 @@ PathTraceImage render_path_traced_image(const std::vector<PathTraceTriangle>& tr
     const size_t pixel_count = size_t(settings.width) * settings.height;
     image.rgb.resize(pixel_count * 3);
     std::vector<Vec3f> accumulated_radiance(pixel_count, Vec3f::Zero());
-    const Scene scene(triangles);
+    const Scene scene(triangles, settings.clipping_plane);
     const Vec3f right = camera.right.normalized();
     const Vec3f up = camera.up.normalized();
     const Vec3f forward = camera.forward.normalized();

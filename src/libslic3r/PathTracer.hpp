@@ -64,6 +64,7 @@ struct PathTraceSettings
     uint32_t samples_per_pixel{16};
     uint32_t sample_batch_size{4};
     uint32_t max_bounces{3};
+    std::array<float, 4> clipping_plane{0.0f, 0.0f, 0.0f, 1.0f};
 };
 
 struct PathTraceImage

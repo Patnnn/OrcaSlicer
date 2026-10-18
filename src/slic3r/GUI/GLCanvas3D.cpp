@@ -2827,6 +2827,7 @@ void GLCanvas3D::_render_scene(const Camera& camera, const Size& cnv_size)
         m_frame_profiler.mark("plates");
 
         if (_is_pathtrace_enabled() && _render_pathtraced_view(camera, cnv_size)) {
+            _render_section_view_caps();
             _render_selection();
             m_frame_profiler.mark("path tracing");
         } else {
@@ -2847,6 +2848,7 @@ void GLCanvas3D::_render_scene(const Camera& camera, const Size& cnv_size)
     else if (m_canvas_type == ECanvasType::CanvasPreview && m_render_preview) {
         bool pathtraced_rendered = false;
         if (_is_pathtrace_enabled()) {
+            m_gcode_viewer.set_clipping_plane(_get_section_view_plane());
             _render_bed(camera.get_view_matrix(), camera.get_projection_matrix(), !camera.is_looking_downward(), m_show_world_axes);
             m_frame_profiler.mark("bed");
             _render_platelist(camera.get_view_matrix(), camera.get_projection_matrix(), !camera.is_looking_downward(), only_current, true, hover_id);
@@ -3410,6 +3412,13 @@ bool GLCanvas3D::_render_pathtraced_view(const Camera& source_camera, const Size
     combine(size_t(cfg_bounces));
     combine(std::hash<float>{}(preview_z_min));
     combine(std::hash<float>{}(preview_z_max));
+    const ClippingPlane clip_plane = _get_volumes_clipping_plane();
+    const bool clipping_active = clip_plane.is_active();
+    combine(size_t(clipping_active));
+    if (clipping_active) {
+        for (double v : clip_plane.get_data())
+            combine(std::hash<double>{}(v));
+    }
     hash_matrix(source_camera.get_view_matrix());
     hash_matrix(source_camera.get_projection_matrix());
     combine(size_t(canvas_size.get_width()));
@@ -3547,6 +3556,13 @@ bool GLCanvas3D::_render_pathtraced_view(const Camera& source_camera, const Size
             compute_shader->set_uniform("max_bounces", cfg_bounces);
             compute_shader->set_uniform("z_min", preview_z_min);
             compute_shader->set_uniform("z_max", preview_z_max);
+            const std::array<float, 4> clipping_plane_uniform = clipping_active
+                ? std::array<float, 4>{ float(clip_plane.get_data()[0]),
+                                        float(clip_plane.get_data()[1]),
+                                        float(clip_plane.get_data()[2]),
+                                        float(clip_plane.get_data()[3]) }
+                : std::array<float, 4>{ 0.0f, 0.0f, 0.0f, 1.0f };
+            compute_shader->set_uniform("clipping_plane", clipping_plane_uniform);
 
             const GLuint groups_x = (render_width + 7) / 8;
             const GLuint groups_y = (render_height + 7) / 8;
@@ -3633,6 +3649,12 @@ bool GLCanvas3D::_render_pathtraced_view(const Camera& source_camera, const Size
         settings.samples_per_pixel = 128;
         settings.sample_batch_size = 4;
         settings.max_bounces = 3;
+        settings.clipping_plane = clipping_active
+            ? std::array<float, 4>{ float(clip_plane.get_data()[0]),
+                                    float(clip_plane.get_data()[1]),
+                                    float(clip_plane.get_data()[2]),
+                                    float(clip_plane.get_data()[3]) }
+            : std::array<float, 4>{ 0.0f, 0.0f, 0.0f, 1.0f };
         const size_t render_signature = m_pathtrace_requested_signature;
         m_pathtrace_cancel.store(false, std::memory_order_relaxed);
         try {

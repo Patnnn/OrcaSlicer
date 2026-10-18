@@ -50,6 +50,7 @@ uniform int sample_count;
 uniform int max_bounces;
 uniform float z_min;
 uniform float z_max;
+uniform vec4 clipping_plane;
 
 const float ray_epsilon = 0.0001;
 
@@ -67,16 +68,41 @@ float random_float(inout uint state)
 }
 
 // Returns the entry distance into the node bounds, or -1.0 if the ray misses them within max_distance.
-float bounds_entry(BvhNode node, vec3 origin, vec3 inv_dir, float max_distance)
+float bounds_entry(BvhNode node, vec3 origin, vec3 dir, vec3 inv_dir, float max_distance)
 {
     if (node.bounds_max.z < min(z_min, -0.05) || node.bounds_min.z > z_max)
         return -1.0;
+
+    bool clipping_active = dot(clipping_plane.xyz, clipping_plane.xyz) > 0.5;
+    if (clipping_active && node.bounds_min.z >= -0.01) {
+        vec3 p_max = vec3(
+            clipping_plane.x >= 0.0 ? node.bounds_max.x : node.bounds_min.x,
+            clipping_plane.y >= 0.0 ? node.bounds_max.y : node.bounds_min.y,
+            clipping_plane.z >= 0.0 ? node.bounds_max.z : node.bounds_min.z
+        );
+        if (dot(p_max, clipping_plane.xyz) + clipping_plane.w < 0.0)
+            return -1.0;
+    }
+
     vec3 t0 = (node.bounds_min.xyz - origin) * inv_dir;
     vec3 t1 = (node.bounds_max.xyz - origin) * inv_dir;
     vec3 tmin = min(t0, t1);
     vec3 tmax = max(t0, t1);
     float near_distance = max(max(tmin.x, tmin.y), max(tmin.z, ray_epsilon));
     float far_distance = min(min(tmax.x, tmax.y), min(tmax.z, max_distance));
+
+    if (clipping_active && node.bounds_min.z >= -0.01) {
+        float denom = dot(dir, clipping_plane.xyz);
+        float dist = dot(origin, clipping_plane.xyz) + clipping_plane.w;
+        if (denom > 1e-5) {
+            near_distance = max(near_distance, -dist / denom);
+        } else if (denom < -1e-5) {
+            far_distance = min(far_distance, -dist / denom);
+        } else if (dist < 0.0) {
+            return -1.0;
+        }
+    }
+
     return far_distance >= near_distance ? near_distance : -1.0;
 }
 
@@ -84,6 +110,15 @@ bool intersect_triangle(Triangle triangle, Ray ray, inout Hit hit)
 {
     if (triangle.a.w >= 0.0 && (triangle.a.w < z_min || triangle.a.w > z_max))
         return false;
+
+    if (triangle.a.w > -1.5 && dot(clipping_plane.xyz, clipping_plane.xyz) > 0.5) {
+        float da = dot(triangle.a.xyz, clipping_plane.xyz) + clipping_plane.w;
+        float db = dot(triangle.b.xyz, clipping_plane.xyz) + clipping_plane.w;
+        float dc = dot(triangle.c.xyz, clipping_plane.xyz) + clipping_plane.w;
+        if (da < 0.0 && db < 0.0 && dc < 0.0)
+            return false;
+    }
+
     vec3 edge1 = triangle.b.xyz - triangle.a.xyz;
     vec3 edge2 = triangle.c.xyz - triangle.a.xyz;
     vec3 cross_value = cross(ray.direction, edge2);
@@ -105,6 +140,12 @@ bool intersect_triangle(Triangle triangle, Ray ray, inout Hit hit)
     if (distance < ray_epsilon || distance >= hit.distance)
         return false;
 
+    float u_clamped = clamp(u, 0.0, 1.0);
+    float v_clamped = clamp(v, 0.0, max(0.0, 1.0 - u_clamped));
+    vec3 hit_pos = (1.0 - u_clamped - v_clamped) * triangle.a.xyz + u_clamped * triangle.b.xyz + v_clamped * triangle.c.xyz;
+    if (triangle.a.w > -1.5 && (dot(hit_pos, clipping_plane.xyz) + clipping_plane.w < 0.0))
+        return false;
+
     vec3 edge3 = triangle.c.xyz - triangle.b.xyz;
     float len1 = dot(edge1, edge1);
     float len2 = dot(edge2, edge2);
@@ -121,10 +162,8 @@ bool intersect_triangle(Triangle triangle, Ray ray, inout Hit hit)
     if (normal_len <= 0.0)
         return false;
 
-    float u_clamped = clamp(u, 0.0, 1.0);
-    float v_clamped = clamp(v, 0.0, max(0.0, 1.0 - u_clamped));
     hit.distance = distance;
-    hit.position = (1.0 - u_clamped - v_clamped) * triangle.a.xyz + u_clamped * triangle.b.xyz + v_clamped * triangle.c.xyz;
+    hit.position = hit_pos;
     hit.normal = raw_normal / normal_len;
     if (dot(hit.normal, ray.direction) > 0.0)
         hit.normal = -hit.normal;
@@ -145,7 +184,7 @@ bool traverse_scene(Ray ray, inout Hit hit, bool any_hit)
                          abs(ray.direction.z) < 1e-8 ? 1e-8 : ray.direction.z);
     vec3 inv_dir = 1.0 / safe_dir;
 
-    if (bounds_entry(nodes[0], ray.origin, inv_dir, hit.distance) < 0.0)
+    if (bounds_entry(nodes[0], ray.origin, ray.direction, inv_dir, hit.distance) < 0.0)
         return false;
 
     bool found = false;
@@ -168,8 +207,8 @@ bool traverse_scene(Ray ray, inout Hit hit, bool any_hit)
                 }
             }
         } else {
-            float dl = bounds_entry(nodes[node.data.z], ray.origin, inv_dir, hit.distance);
-            float dr = bounds_entry(nodes[node.data.w], ray.origin, inv_dir, hit.distance);
+            float dl = bounds_entry(nodes[node.data.z], ray.origin, ray.direction, inv_dir, hit.distance);
+            float dr = bounds_entry(nodes[node.data.w], ray.origin, ray.direction, inv_dir, hit.distance);
             if (stack_size + 2 > 32)
                 break;
             uint near_child = node.data.z, far_child = node.data.w;
