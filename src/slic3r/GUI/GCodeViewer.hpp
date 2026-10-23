@@ -463,6 +463,8 @@ public:
     const libvgcode::Interval& get_gcode_view_full_range() const { return m_viewer.get_view_full_range(); }
     const libvgcode::Interval& get_gcode_view_enabled_range() const { return m_viewer.get_view_enabled_range(); }
     const libvgcode::Interval& get_gcode_view_visible_range() const { return m_viewer.get_view_visible_range(); }
+    bool is_top_layer_only_view_range() const { return m_viewer.is_top_layer_only_view_range(); }
+    void render_sequential_marker(int canvas_width, int canvas_height);
     const libvgcode::PathVertex& get_gcode_vertex_at(size_t id) const { return m_viewer.get_vertex_at(id); }
 
     bool is_contained_in_bed() const { return m_contained_in_bed; }
@@ -495,6 +497,8 @@ public:
     }
 
     libvgcode::EViewType get_view_type() const { return m_viewer.get_view_type(); }
+    bool is_extrusion_role_visible(libvgcode::EGCodeExtrusionRole role) const { return m_viewer.is_extrusion_role_visible(role); }
+    libvgcode::Color get_gcode_vertex_color(const libvgcode::PathVertex& vertex) const { return m_viewer.get_vertex_color(vertex); }
 
     // ORCA: darken the layers not scrubbed to while using the preview layer slider
     void set_dim_previous_layers(bool value) { m_viewer.set_dim_previous_layers(value); }
@@ -522,6 +526,7 @@ public:
     void pop_combo_style();
 
     void invalidate_legend() { /*TODO: m_legend_resizer.reset();*/ }
+    void render_shells(int canvas_width, int canvas_height);
 
 #if VGCODE_ENABLE_COG_AND_TOOL_MARKERS
     float get_cog_marker_scale_factor() const { return m_viewer.get_cog_marker_scale_factor(); }
@@ -534,7 +539,6 @@ private:
     // Canvas height minus the room the horizontal slider takes.
     int sequential_view_height(int canvas_height) const;
     void render_toolpaths();
-    void render_shells(int canvas_width, int canvas_height);
 
     //BBS: GUI refactor: add canvas size
     void render_legend(float &legend_height, int canvas_width, int canvas_height, int right_margin);
