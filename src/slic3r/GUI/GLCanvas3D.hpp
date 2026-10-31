@@ -797,6 +797,8 @@ private:
         size_t instance_id{0};
         int plate_idx{-1};
         bool is_wipe_tower{false};
+        // The leaves hold toolpath beads instead of triangles.
+        bool beads{false};
     };
     std::vector<PathTraceVolumeBlas> m_pathtrace_volume_blas;
     std::vector<PathTraceGpuInstance> m_pathtrace_gpu_instances;
@@ -833,14 +835,18 @@ private:
         bool is_preview{false};
         // Subsurface scattering family of each extruder's filament, read from the presets on the GUI thread.
         std::vector<int> extruder_sss_families;
+        // Toolpaths in Preview: one bead per segment, with its G-code vertex, the top of its layer,
+        // its layer height and its roughness plus twice its subsurface scattering mode.
+        std::vector<PathTraceBead> preview_beads;
+        std::vector<size_t> source_bead_vertex_id;
+        std::vector<float> source_bead_tag_z;
+        std::vector<float> source_bead_height;
+        std::vector<float> source_bead_role;
+        // Seam markers in Preview, with their G-code vertex, center and layer height.
         std::vector<PathTraceTriangle> preview_triangles;
         std::vector<size_t> source_tri_vertex_id;
         std::vector<float> source_tri_tag_z;
         std::vector<float> source_tri_height;
-        std::vector<float> source_tri_role;
-        std::vector<float> source_tri_facet;
-        std::vector<float> source_tri_delta_angle;
-        std::vector<float> source_tri_opacity;
         struct VolumeGroupTriangles {
             size_t instance_id{0};
             bool is_wipe_tower{false};
