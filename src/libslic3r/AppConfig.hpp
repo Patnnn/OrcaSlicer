@@ -50,6 +50,9 @@
 #define SETTING_OPENGL_REALISTIC_PREVIEW "opengl_realistic_preview"
 #define SETTING_OPENGL_REALISTIC_GLOSS "opengl_realistic_gloss"
 #define SETTING_OPENGL_PATHTRACE_QUALITY "opengl_pathtrace_quality"
+// Debug: the path tracer traces Preview toolpaths as analytic beads, or as the triangle mesh with
+// shaded round profiles they replace, to compare the two. Switched in the FPS overlay.
+#define SETTING_OPENGL_PATHTRACE_TOOLPATH_BEADS "opengl_pathtrace_toolpath_beads"
 
 #define SETTING_PLUGIN_PAGES_VISIBLE_COUNT "plugin_pages_visible_count"
 #define PLUGIN_PAGES_VISIBLE_COUNT_MIN 1

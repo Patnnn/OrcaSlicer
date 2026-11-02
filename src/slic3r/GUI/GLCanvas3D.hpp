@@ -842,11 +842,17 @@ private:
         std::vector<float> source_bead_tag_z;
         std::vector<float> source_bead_height;
         std::vector<float> source_bead_role;
-        // Seam markers in Preview, with their G-code vertex, center and layer height.
+        // Seam markers in Preview, and the toolpath mesh in the debug mode without beads, with their
+        // G-code vertex, top of their layer (center of a seam), layer height, roughness plus twice the
+        // subsurface scattering mode, facet kind, curvature angle and opacity.
         std::vector<PathTraceTriangle> preview_triangles;
         std::vector<size_t> source_tri_vertex_id;
         std::vector<float> source_tri_tag_z;
         std::vector<float> source_tri_height;
+        std::vector<float> source_tri_role;
+        std::vector<float> source_tri_facet;
+        std::vector<float> source_tri_delta_angle;
+        std::vector<float> source_tri_opacity;
         struct VolumeGroupTriangles {
             size_t instance_id{0};
             bool is_wipe_tower{false};

@@ -348,6 +348,8 @@ void AppConfig::set_defaults()
 
     if (get(SETTING_OPENGL_PATHTRACE_QUALITY).empty())
         set(SETTING_OPENGL_PATHTRACE_QUALITY, "medium");
+    if (get(SETTING_OPENGL_PATHTRACE_TOOLPATH_BEADS).empty())
+        set_bool(SETTING_OPENGL_PATHTRACE_TOOLPATH_BEADS, true);
 
     // Replaces the on/off setting, whose shadows turned with the camera.
     if (get(SETTING_OPENGL_REALISTIC_SHADOWS).empty())
