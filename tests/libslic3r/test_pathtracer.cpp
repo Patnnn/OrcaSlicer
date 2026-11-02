@@ -364,7 +364,7 @@ TEST_CASE("Path tracer bead intersection agrees with the distance to the bead", 
         if (entry < 0.0) {
             // A miss; a hit there can only be a graze.
             if (hit)
-                REQUIRE(reference_bead_distance(bead, o + double(t_in) * d) < 1e-4);
+                REQUIRE(reference_bead_distance(bead, o + double(t_in) * d) < 2e-4);
             continue;
         }
         ++hits;
@@ -373,9 +373,9 @@ TEST_CASE("Path tracer bead intersection agrees with the distance to the bead", 
             REQUIRE(reference_bead_distance(bead, o + (entry + 1e-3) * d) > -1e-4);
             continue;
         }
-        // The hit lies on the surface within the float precision of a ray 300 mm long; along a grazing
-        // ray that precision stretches.
-        REQUIRE_THAT(reference_bead_distance(bead, o + double(t_in) * d), Catch::Matchers::WithinAbs(0.0, 5e-5));
+        // The hit lies on the surface within the tolerance of the Newton steps, 1e-4 mm, and the float
+        // precision of a ray 300 mm long; along a grazing ray that precision stretches.
+        REQUIRE_THAT(reference_bead_distance(bead, o + double(t_in) * d), Catch::Matchers::WithinAbs(0.0, 1.5e-4));
         REQUIRE_THAT(t_in, Catch::Matchers::WithinAbs(entry, 2e-3));
         REQUIRE(t_out >= t_in);
         const Vec3f n = path_trace_bead_normal(bead, origin + t_in * dir);

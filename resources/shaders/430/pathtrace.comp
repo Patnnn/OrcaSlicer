@@ -705,8 +705,8 @@ bool shadow_leaf_test(uint i, Ray local_ray, float loc_scale)
 // of beads far from the origin; both ends of the interval give the path length through the bead.
 // Mirrored by intersect_path_trace_bead() in PathTracer.cpp, which the tests check.
 const int BEAD_NEWTON_STEPS = 12;
-// Distance from the surface, in mm, at which a ray has reached it.
-const float BEAD_TOLERANCE = 1e-6;
+// Distance from the surface, in mm, at which a ray has reached it: far below what a pixel shows.
+const float BEAD_TOLERANCE = 1e-4;
 
 struct BeadRay
 {
@@ -781,6 +781,12 @@ bool bead_interval(BeadRay br, float t_limit, float exit_below, out float t_in, 
     float box_in = max3(t_min);
     float box_out = min3(t_max);
     if (box_out < max(box_in, ray_epsilon) || box_in >= t_limit)
+        return false;
+    // The ray's line passes the stadium section of the bead's body on one side: a miss, before the
+    // Newton steps, which take longest on misses.
+    vec3 d = br.direction;
+    float side = abs(d.z * br.origin.y - d.y * br.origin.z) - abs(br.flat_half * d.z);
+    if (side > 0.0 && side * side > br.radius * br.radius * dot(d.yz, d.yz))
         return false;
     float entry = bead_newton(br, br.origin + box_in * br.direction, br.direction, box_out - box_in);
     if (entry < 0.0)

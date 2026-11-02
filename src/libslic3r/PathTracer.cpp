@@ -23,7 +23,10 @@
 namespace Slic3r {
 namespace {
 
-constexpr size_t leaf_primitive_count = 4;
+// Primitives a leaf holds at most. A bead test costs several triangle tests, so beads take a leaf
+// each: the deeper tree culls more of them than its extra boxes cost.
+constexpr size_t leaf_triangle_count = 4;
+constexpr size_t leaf_bead_count = 1;
 constexpr int max_bvh_depth = 24;
 constexpr size_t sah_bin_count = 12;
 
@@ -65,9 +68,10 @@ struct BvhNode
 class BvhBuilder
 {
 public:
-    // Builds over the bounds and centroids of the primitives, which it consumes.
-    BvhBuilder(std::vector<Bounds> prim_bounds, std::vector<Vec3f> prim_centroids, const std::atomic<bool>* cancel_token = nullptr)
-        : m_prim_bounds(std::move(prim_bounds)), m_prim_centroids(std::move(prim_centroids)), m_cancel_token(cancel_token)
+    // Builds over the bounds and centroids of the primitives, which it consumes, with at most leaf_size
+    // primitives in a leaf.
+    BvhBuilder(std::vector<Bounds> prim_bounds, std::vector<Vec3f> prim_centroids, size_t leaf_size, const std::atomic<bool>* cancel_token = nullptr)
+        : m_prim_bounds(std::move(prim_bounds)), m_prim_centroids(std::move(prim_centroids)), m_leaf_size(leaf_size), m_cancel_token(cancel_token)
     {
         assert(m_prim_bounds.size() == m_prim_centroids.size());
         if (cancelled())
@@ -167,7 +171,7 @@ private:
             centroids.include(m_prim_centroids[idx]);
         }
         m_nodes[node_index].bounds = bounds;
-        if (count <= leaf_primitive_count || depth >= max_bvh_depth) {
+        if (count <= m_leaf_size || depth >= max_bvh_depth) {
             m_nodes[node_index].first = first;
             m_nodes[node_index].count = count;
             m_nodes[node_index].left = -1;
@@ -300,6 +304,7 @@ private:
     std::vector<Vec3f> m_prim_centroids;
     std::vector<BvhNode> m_nodes;
     std::atomic<uint32_t> m_node_count{0};
+    size_t m_leaf_size;
     const std::atomic<bool>* m_cancel_token{nullptr};
 };
 
@@ -465,7 +470,7 @@ PathTraceGpuScene pack_path_trace_scene(const BvhBuilder& bvh, const std::vector
 // Newton steps of a ray towards a bead's surface, BEAD_NEWTON_STEPS in pathtrace.comp.
 constexpr int bead_newton_steps = 12;
 // Distance from a bead's surface at which a ray has reached it, in mm, BEAD_TOLERANCE in pathtrace.comp.
-constexpr float bead_tolerance = 1e-6f;
+constexpr float bead_tolerance = 1e-4f;
 
 // Distance from the flat region of a bead minus its radius, and its gradient, in the bead's frame:
 // bead_distance() in pathtrace.comp.
@@ -555,6 +560,10 @@ bool intersect_path_trace_bead(const PathTraceBead& bead, const Vec3f& origin, c
     }
     if (t1 < t0)
         return false;
+    // The ray's line passes the stadium section of the bead's body on one side: a miss.
+    const float side = std::abs(d.z() * o.y() - d.y() * o.z()) - std::abs(flat * d.z());
+    if (side > 0.0f && side * side > radius * radius * (d.y() * d.y() + d.z() * d.z()))
+        return false;
     const float entry = bead_newton(o + t0 * d, d, t1 - t0, length, flat, radius);
     if (entry < 0.0f)
         return false;
@@ -588,7 +597,7 @@ PathTraceGpuScene build_path_trace_gpu_scene(const std::vector<PathTraceTriangle
                 centroids[i] = (tri.a + tri.b + tri.c) * (1.0f / 3.0f);
             }
         });
-    const BvhBuilder bvh(std::move(bounds), std::move(centroids), cancel_token);
+    const BvhBuilder bvh(std::move(bounds), std::move(centroids), leaf_triangle_count, cancel_token);
     PathTraceGpuScene packed = pack_path_trace_scene(bvh, triangles, [](const PathTraceTriangle& source, PathTraceGpuTriangle& slot) {
         for (size_t axis = 0; axis < 3; ++axis) {
             slot.a[axis] = source.a[axis];
@@ -617,7 +626,7 @@ PathTraceGpuScene build_path_trace_gpu_scene(const std::vector<PathTraceBead>& b
                 centroids[i] = 0.5f * (beads[i].p0 + beads[i].p1);
             }
         });
-    const BvhBuilder bvh(std::move(bounds), std::move(centroids), cancel_token);
+    const BvhBuilder bvh(std::move(bounds), std::move(centroids), leaf_bead_count, cancel_token);
     return pack_path_trace_scene(bvh, beads, [](const PathTraceBead& source, PathTraceGpuTriangle& slot) {
         for (size_t axis = 0; axis < 3; ++axis) {
             slot.a[axis] = source.p0[axis];
