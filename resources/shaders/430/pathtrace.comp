@@ -707,6 +707,11 @@ bool shadow_leaf_test(uint i, Ray local_ray, float loc_scale)
 const int BEAD_NEWTON_STEPS = 12;
 // Distance from the surface, in mm, at which a ray has reached it: far below what a pixel shows.
 const float BEAD_TOLERANCE = 1e-4;
+// Overlapping beads of a layer share the plane of their flat tops, where a ray hits both at the same
+// distance. Hits closer together than this, in mm, are one: the bead printed later, which lies on
+// top in the print, takes it. Otherwise which one the traversal meets first would decide, pixel by
+// pixel, and the edge between a top surface and its wall would fray.
+const float BEAD_TIE = 1e-3;
 
 struct BeadRay
 {
@@ -826,7 +831,10 @@ void closest_bead_test(uint i, Ray local_ray, float loc_scale, uint inst_idx, in
     bool translucent = opacity < OPAQUE_OPACITY;
     if (g_only_opaque && translucent)
         return;
-    float t_limit = hit.distance * loc_scale;
+    // The closest hit so far is a bead of this instance: a tie with it goes to the later move.
+    bool tie = hit.inst_index == inst_idx && hit.tri_index != NO_HIT;
+    float t_hit = hit.distance * loc_scale;
+    float t_limit = tie ? t_hit + BEAD_TIE : t_hit;
     float near_limit = max(ray_epsilon, g_has_clipping ? g_clip_near * loc_scale : 0.0);
     bool sees_inside = translucent || g_has_clipping || g_only_instance != NO_HIT;
     BeadRay br = bead_ray(bead, local_ray.origin, local_ray.direction);
@@ -837,6 +845,8 @@ void closest_bead_test(uint i, Ray local_ray, float loc_scale, uint inst_idx, in
     bool inside = t_in < near_limit;
     float t_local = inside ? t_out : t_in;
     if (t_local < near_limit || t_local >= t_limit)
+        return;
+    if (tie && t_local > t_hit - BEAD_TIE && floatBitsToUint(bead.b.w) < floatBitsToUint(triangles[hit.tri_index].b.w))
         return;
     float t_world = t_local / loc_scale;
     if (g_has_clipping && t_world > g_clip_far)
@@ -915,7 +925,9 @@ bool traverse_blas(int mode, uint root, bool is_print_inst, bool beads, uint ins
     vec3 origin_inv = local_ray.origin * local_inv_dir;
 
     BvhNode node = nodes[root];
-    if (node_entry(node, z_cull, local_inv_dir, origin_inv, t_near, min(clip_far, hit.distance * loc_scale)) < 0.0)
+    // A bead tied with the closest hit lies up to BEAD_TIE behind it.
+    float tie_reach = beads ? BEAD_TIE : 0.0;
+    if (node_entry(node, z_cull, local_inv_dir, origin_inv, t_near, min(clip_far, hit.distance * loc_scale + tie_reach)) < 0.0)
         return false;
 
     uint stack_index[32];
@@ -927,7 +939,7 @@ bool traverse_blas(int mode, uint root, bool is_print_inst, bool beads, uint ins
             uint left = uint(floatBitsToInt(node.bounds_min.w));
             BvhNode node_a = nodes[left];
             BvhNode node_b = nodes[left + 1u];
-            float t_far = min(clip_far, hit.distance * loc_scale);
+            float t_far = min(clip_far, hit.distance * loc_scale + tie_reach);
             float d_a = node_entry(node_a, z_cull, local_inv_dir, origin_inv, t_near, t_far);
             float d_b = node_entry(node_b, z_cull, local_inv_dir, origin_inv, t_near, t_far);
             if (d_a >= 0.0 && d_b >= 0.0) {
