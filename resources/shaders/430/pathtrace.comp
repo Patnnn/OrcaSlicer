@@ -221,6 +221,8 @@ bool g_has_clipping = false;
 bool g_has_move_filter = false;
 bool g_has_z_filter = false;
 bool g_only_opaque = false;
+// Where the last translucent bead the ray started inside of ends, in world units, or below zero.
+float g_bead_far = -1.0;
 bool g_interactive = false;
 // Distances along the current ray between which the section view keeps geometry.
 float g_clip_near = 0.0;
@@ -843,6 +845,8 @@ void closest_bead_test(uint i, Ray local_ray, float loc_scale, uint inst_idx, in
     if (!bead_interval(br, t_limit, sees_inside ? near_limit : -FLT_BIG, t_in, t_out))
         return;
     bool inside = t_in < near_limit;
+    if (inside && translucent)
+        g_bead_far = max(g_bead_far, t_out / loc_scale);
     float t_local = inside ? t_out : t_in;
     if (t_local < near_limit || t_local >= t_limit)
         return;
@@ -1447,6 +1451,10 @@ void trace_path(Ray ray, out vec3 radiance, out float coverage, out vec3 bed_ter
     int max_trans = g_interactive ? (is_preview_canvas ? 8 : 6) : max(max_trans_bounces, 4);
     Ray r = ray;
     bool done = false;
+    // Where the ray entered the fused translucent beads it is in, and the path its front took, or
+    // below zero when it is not known to have come through their front.
+    vec3 wall_start = vec3(0.0);
+    float wall_front = -1.0;
 
     int probe = PROBE_NONE;
     float probe_max = 0.0;
@@ -1489,6 +1497,7 @@ void trace_path(Ray ray, out vec3 radiance, out float coverage, out vec3 bed_ter
         hit.distance = probe != PROBE_NONE ? probe_max : FLT_BIG;
         g_only_opaque = probe == PROBE_NONE && trans >= max_trans;
         g_only_instance = probe != PROBE_NONE ? probe_inst : NO_HIT;
+        g_bead_far = -1.0;
         bool has_hit = intersect_scene(r, hit);
         g_only_instance = NO_HIT;
         g_only_opaque = false;
@@ -1515,6 +1524,15 @@ void trace_path(Ray ray, out vec3 radiance, out float coverage, out vec3 bed_ter
             probe = PROBE_NONE;
             r = resume;
             done = resume_done;
+            continue;
+        }
+
+        // Translucent beads are fused where they overlap: a face inside another bead is no surface.
+        // The closest hit lies inside a bead only if the ray started inside that bead, as that
+        // bead's entry would be closer otherwise, so this needs no further query. Go on from just
+        // behind the face: markers and opaque beads may lie further inside.
+        if (has_hit && hit.bead && hit.opacity < OPAQUE_OPACITY && g_bead_far > hit.distance + BEAD_TIE) {
+            r.origin += r.direction * (hit.distance + BEAD_TIE);
             continue;
         }
 
@@ -1627,9 +1645,19 @@ void trace_path(Ray ray, out vec3 radiance, out float coverage, out vec3 bed_ter
             // slab with near parallel faces, so the light going through leaves it in the direction it
             // came in: a print is no solid block of plastic, it neither bends the view through it nor
             // reflects totally inside.
-            // A bead is crossed twice, at its front and its back: each takes half its path length.
+            // A bead is crossed twice, at its front and its back: each takes half its path length. Fused
+            // beads count as one: the front takes half the first bead, the back the rest of the way.
             float wall = toolpath ? 0.5 * (hit.bead ? hit.chord : bead_path(r.direction, sh.params.x))
                                   : PREPARE_WALL / max(transmitted_cos(dot(ng, v)), 0.2);
+            if (hit.bead) {
+                if (hit.front_face) {
+                    wall_start = hit.position;
+                    wall_front = wall;
+                } else if (wall_front >= 0.0) {
+                    wall = max(distance(hit.position, wall_start) - wall_front, 0.0);
+                    wall_front = -1.0;
+                }
+            }
             float straight = exp(-straight_extinction(opacity) * wall);
             vec3 tint = exp(-dye_extinction(albedo) * wall);
             float reflect_share = diffuse_reflect_share(opacity);
@@ -1675,6 +1703,7 @@ void trace_path(Ray ray, out vec3 radiance, out float coverage, out vec3 bed_ter
                     refl = reflect(-v, ng);
                 throughput *= ggx_g1(max(dot(ns, refl), 1e-3), alpha * alpha) * (f / p_reflect);
                 chain = false;
+                wall_front = -1.0;
                 if (depth >= max_bounces) {
                     if (hit.front_face)
                         contribute(throughput * sky_radiance(refl), depth);
@@ -1704,6 +1733,7 @@ void trace_path(Ray ray, out vec3 radiance, out float coverage, out vec3 bed_ter
             // Diffused by the wall: Lambertian in the filament color, on the side the light came from
             // with reflect_share, through to the far side otherwise.
             chain = false;
+            wall_front = -1.0;
             throughput *= diffuse_albedo;
             float key_cos = max(dot(lit_front ? ns : -ns, l), 0.0) * (lit_front ? reflect_share : 1.0 - reflect_share);
             queue_shadow(shadow_origin, l, key_weight + throughput * (INV_PI * key_cos * KEY_IRRADIANCE), depth, false);
