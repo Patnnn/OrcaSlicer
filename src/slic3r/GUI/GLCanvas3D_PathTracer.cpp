@@ -639,7 +639,8 @@ void GLCanvas3D::_extract_preview_toolpaths_for_pathtrace(
         }
         // Debug: the triangle mesh the beads replace, see SETTING_OPENGL_PATHTRACE_TOOLPATH_BEADS.
         const AppConfig* cfg = wxGetApp().app_config;
-        if (cfg == nullptr || cfg->get_bool(SETTING_OPENGL_PATHTRACE_TOOLPATH_BEADS)) {
+        const bool use_beads = cfg == nullptr || cfg->get_bool(SETTING_OPENGL_PATHTRACE_TOOLPATH_BEADS);
+        if (use_beads) {
             job.preview_beads.reserve(segments.size());
             job.source_bead_vertex_id.reserve(segments.size());
             job.source_bead_tag_z.reserve(segments.size());
@@ -903,8 +904,10 @@ void GLCanvas3D::_extract_preview_toolpaths_for_pathtrace(
 
                 const float h = (v.height > 0.01f ? v.height : 0.20f);
                 const float w = (v.width > 0.01f ? v.width : 0.45f);
-                const float half_h = 0.75f * h;
-                const float r = 0.75f * w;
+                // Beads reach half the width out at mid height: there, these markers are half a layer
+                // high, so that those of the layers of a wall join up into a band.
+                const float half_h = use_beads ? h : 0.75f * h;
+                const float r = use_beads ? w : 0.75f * w;
                 const Vec3f center{v.position[0], v.position[1], v.position[2] - 0.5f * h};
                 const Vec3f top = center + Vec3f(0.0f, 0.0f, half_h);
                 const Vec3f bot = center - Vec3f(0.0f, 0.0f, half_h);
