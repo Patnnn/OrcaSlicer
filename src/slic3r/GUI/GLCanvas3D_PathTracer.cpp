@@ -1791,6 +1791,15 @@ bool GLCanvas3D::_render_pathtraced_view(const Camera& source_camera, const Size
     combine(size_t(quality_preset));
     combine(size_t(_shadow_mode()));
     combine(size_t(glossy_toolpaths));
+    // Analytic beads only: the debug triangle mesh has no path lengths through its beads.
+    const auto colors_by_filament = [](libvgcode::EViewType type) {
+        return type == libvgcode::EViewType::Summary || type == libvgcode::EViewType::ColorPrint || type == libvgcode::EViewType::Tool;
+    };
+    const bool filament_layers = m_canvas_type == ECanvasType::CanvasPreview && wxGetApp().app_config != nullptr &&
+                                 wxGetApp().app_config->get_bool(SETTING_OPENGL_PATHTRACE_FILAMENT_LAYERS) &&
+                                 wxGetApp().app_config->get_bool(SETTING_OPENGL_PATHTRACE_TOOLPATH_BEADS) &&
+                                 colors_by_filament(m_gcode_viewer.get_view_type());
+    combine(size_t(filament_layers));
     combine(std::hash<float>{}(preview_z_min));
     combine(std::hash<float>{}(preview_z_max));
     combine(std::hash<int>{}(preview_move_min));
@@ -2046,6 +2055,7 @@ bool GLCanvas3D::_render_pathtraced_view(const Camera& source_camera, const Size
             compute_shader->set_uniform("light_direction_uniform", light_dir);
             compute_shader->set_uniform("fill_direction_uniform", fill_dir);
             compute_shader->set_uniform("glossy_toolpaths", glossy_toolpaths);
+            compute_shader->set_uniform("filament_layers", filament_layers);
             compute_shader->set_uniform("shadows_enabled", _shadow_mode() != EShadowMode::Off);
             compute_shader->set_uniform("layer_profile_mode", (m_canvas_type == ECanvasType::CanvasPreview) ? 1 : 0);
             compute_shader->set_uniform("is_preview_canvas", m_canvas_type == ECanvasType::CanvasPreview);

@@ -2220,6 +2220,14 @@ void PreferencesDialog::create_items()
             _L("Configures the quality and performance of the GPU path tracer."),
             SETTING_OPENGL_PATHTRACE_QUALITY, PtQualityLabels, PtQualityValues);
         g_sizer->Add(item_pt_quality);
+
+        auto item_pt_filament_layers = create_item_checkbox(
+            _L("Light through filament layers"),
+            _L("Shows in Preview what lies behind thin layers of opaque filament, so that stacked colors blend as in a"
+               " color-layered print. Applies to the views that color toolpaths by filament.\n"
+               "Costs more rendering time on every print."),
+            SETTING_OPENGL_PATHTRACE_FILAMENT_LAYERS);
+        g_sizer->Add(item_pt_filament_layers);
     }
 
     auto item_realistic_preview = create_item_checkbox(

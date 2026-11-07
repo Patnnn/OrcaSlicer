@@ -53,6 +53,8 @@
 // Debug: the path tracer traces Preview toolpaths as analytic beads, or as the triangle mesh with
 // shaded round profiles they replace, to compare the two. Switched in the FPS overlay.
 #define SETTING_OPENGL_PATHTRACE_TOOLPATH_BEADS "opengl_pathtrace_toolpath_beads"
+// The path tracer shows the layers of opaque filaments in Preview letting light through.
+#define SETTING_OPENGL_PATHTRACE_FILAMENT_LAYERS "opengl_pathtrace_filament_layers"
 
 #define SETTING_PLUGIN_PAGES_VISIBLE_COUNT "plugin_pages_visible_count"
 #define PLUGIN_PAGES_VISIBLE_COUNT_MIN 1
