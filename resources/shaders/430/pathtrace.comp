@@ -176,6 +176,9 @@ const float OPAQUE_OPACITY = 0.96;
 const float LAYER_RESIDUAL = 0.015;
 // Largest extinction of a channel in a layer of opaque filament, per mm.
 const float LAYER_MAX_EXTINCTION = 16.0;
+// Air along a walk through the layers of a filament that ends it, in mm: wider than the grooves
+// between neighboring beads.
+const float LAYER_AIR_GAP = 0.15;
 // Saunderson's correction for an index of 1.5: reflectance of the surface from outside at normal
 // incidence, and of diffuse light from inside.
 const float SAUNDERSON_OUTSIDE = 0.04;
@@ -242,6 +245,9 @@ bool g_only_opaque = false;
 float g_bead_far = -1.0;
 // The ray looks through the beads behind a surface, opaque ones too, from inside the ones it overlaps.
 bool g_layer_march = false;
+// The walk has found a bead it starts inside of: it first goes on to where that ends, whatever other
+// bead it enters on its way, or the plastic up to there would go uncounted.
+bool g_layer_inside = false;
 bool g_interactive = false;
 // Distances along the current ray between which the section view keeps geometry.
 float g_clip_near = 0.0;
@@ -897,14 +903,19 @@ void closest_bead_test(uint i, Ray local_ray, float loc_scale, uint inst_idx, in
     bool inside = t_in < near_limit;
     if (inside && translucent)
         g_bead_far = max(g_bead_far, t_out / loc_scale);
-    float t_local = inside ? t_out : t_in;
-    if (t_local < near_limit || t_local >= t_limit)
+    if (g_layer_march && !inside && g_layer_inside)
         return;
-    if (tie && t_local > t_hit - BEAD_TIE && bead.vertex_id < triangles[hit.tri_index].vertex_id)
+    bool replaces_entry = g_layer_march && inside && !g_layer_inside;
+    float t_local = inside ? t_out : t_in;
+    if (t_local < near_limit || (!replaces_entry && t_local >= t_limit))
+        return;
+    if (!replaces_entry && tie && t_local > t_hit - BEAD_TIE && bead.vertex_id < triangles[hit.tri_index].vertex_id)
         return;
     float t_world = t_local / loc_scale;
     if (g_has_clipping && t_world > g_clip_far)
         return;
+    if (g_layer_march && inside)
+        g_layer_inside = true;
     hit.distance = t_world;
     hit.bary = vec2(inside ? 1.0 : 0.0, 0.0);
     hit.tag = bead.tag_z;
@@ -1564,6 +1575,7 @@ void trace_path(Ray ray, out vec3 radiance, out float coverage, out vec3 bed_ter
         hit.distance = probe != PROBE_NONE ? probe_max : FLT_BIG;
         g_only_opaque = probe == PROBE_NONE && trans >= max_trans && !layers_marching;
         g_layer_march = layers_marching;
+        g_layer_inside = false;
         g_only_instance = probe != PROBE_NONE ? probe_inst : NO_HIT;
         g_bead_far = -1.0;
         bool has_hit = intersect_scene(r, hit);
@@ -1610,11 +1622,15 @@ void trace_path(Ray ray, out vec3 radiance, out float coverage, out vec3 bed_ter
         if (layers_marching) {
             bool stop = !has_hit;
             float advance = 0.0;
-            // Air behind the last layer sends back what the surface there reflects inside.
+            // Air behind the last layer sends back what the surface there reflects inside. The light
+            // going on through it is scattered, and lost in the dark of the part: what lies across the
+            // air does not show through the wall.
             vec3 base = vec3(SAUNDERSON_INSIDE);
             if (has_hit && hit.tag < -1.5) {
                 stop = true;
                 base = saunderson_inside(shadings[hit.tri_index].albedo.rgb);
+            } else if (has_hit && hit.front_face && hit.distance > LAYER_AIR_GAP) {
+                stop = true;
             } else if (has_hit && (!hit.bead || shadings[hit.tri_index].params.z > 3.5)) {
                 // A marker within the print.
                 advance = hit.distance;
