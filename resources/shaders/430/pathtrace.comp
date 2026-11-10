@@ -1572,7 +1572,9 @@ void trace_path(Ray ray, out vec3 radiance, out float coverage, out vec3 bed_ter
             break;
 
         Hit hit;
-        hit.distance = probe != PROBE_NONE ? probe_max : FLT_BIG;
+        // A walk through the layers of a filament looks no further than the widest air it crosses:
+        // the bead it is inside of is found wherever that ends, and wider air ends the walk.
+        hit.distance = probe != PROBE_NONE ? probe_max : (layers_marching ? LAYER_AIR_GAP + BEAD_TIE : FLT_BIG);
         g_only_opaque = probe == PROBE_NONE && trans >= max_trans && !layers_marching;
         g_layer_march = layers_marching;
         g_layer_inside = false;
@@ -1626,6 +1628,7 @@ void trace_path(Ray ray, out vec3 radiance, out float coverage, out vec3 bed_ter
             // going on through it is scattered, and lost in the dark of the part: what lies across the
             // air does not show through the wall.
             vec3 base = vec3(SAUNDERSON_INSIDE);
+            // The bed, right behind the last layer.
             if (has_hit && hit.tag < -1.5) {
                 stop = true;
                 base = saunderson_inside(shadings[hit.tri_index].albedo.rgb);
@@ -1652,8 +1655,11 @@ void trace_path(Ray ray, out vec3 radiance, out float coverage, out vec3 bed_ter
                 vec3 denominator = 1.0 - layers_reflect * layer_reflect;
                 layers_reflect += layers_through * layers_through * layer_reflect / denominator;
                 layers_through *= layer_through / denominator;
-                // Past the budget, what lies behind counts as more of the same filament.
-                if (max3(layers_through) < 0.02 || ++layers_count >= (g_interactive ? 12 : 32)) {
+                // Light reaches what lies behind and comes back through the layers in front, so that
+                // adds at most the square of what gets through: below 0.5%, or past the budget, what
+                // lies behind counts as more of the same filament.
+                float through = max3(layers_through);
+                if (through * through < 0.005 || ++layers_count >= (g_interactive ? 12 : 32)) {
                     stop = true;
                     base = saunderson_inside(layer_color);
                 }
