@@ -118,8 +118,14 @@ uniform bool bed_hidden;
 // The layers at lit_layer_z and the toolpath vertex kept_vertex keep their color. The others are
 // scaled by layer_dim in 8 bit sRGB, or, without dimming (layer_dim < 0), grey below grey_below_z.
 uniform vec2 lit_layer_z;
-// Opaque filaments seen in Preview let light through their thin layers, see filament_layer().
-uniform bool filament_layers;
+// Opaque filaments seen in Preview let light through their thin layers, see filament_layer(). Only the
+// program built with FILAMENT_LAYERS walks them: the code of the walk alone makes the other one about a
+// fifth slower where it never runs.
+#ifdef FILAMENT_LAYERS
+const bool filament_layers = true;
+#else
+const bool filament_layers = false;
+#endif
 uniform float grey_below_z;
 uniform float layer_dim;
 uniform int kept_vertex;
