@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -7,6 +8,7 @@
 #include <cstdint>
 #include <future>
 #include <memory>
+#include <numeric>
 #include <utility>
 #include <vector>
 
@@ -148,9 +150,29 @@ private:
     // Tiles dispatched in each timer slot, and the GPU time per tile they measured.
     std::array<uint32_t, 2> m_gpu_timer_tiles{0, 0};
     float m_gpu_ms_per_tile{0.0f};
+    // The mean of the last GPU times of the dispatches, for the overlay only: a single one follows the
+    // tiles of its frame and changes too fast to read.
+    class TimeMean
+    {
+    public:
+        void add(float ms)
+        {
+            m_values[m_next] = ms;
+            m_next = (m_next + 1) % m_values.size();
+            m_count = std::min(m_count + 1, m_values.size());
+        }
+        void clear() { m_count = m_next = 0; }
+        bool empty() const { return m_count == 0; }
+        float value() const { return empty() ? 0.0f : std::accumulate(m_values.begin(), m_values.begin() + m_count, 0.0f) / float(m_count); }
+
+    private:
+        std::array<float, 10> m_values{};
+        size_t m_count{0};
+        size_t m_next{0};
+    };
     float m_gpu_dispatch_time_ms{0.0f};
-    float m_gpu_dispatch_full_res_ms{0.0f};
-    float m_gpu_dispatch_interactive_ms{0.0f};
+    TimeMean m_gpu_dispatch_full_res_ms;
+    TimeMean m_gpu_dispatch_interactive_ms;
     uint32_t m_tile_cursor{ 0 };
     uint32_t m_tiles_per_frame{ 6 };
     // Starts at the lowest scale of the presets: nothing has been timed yet for the first dispatch, which

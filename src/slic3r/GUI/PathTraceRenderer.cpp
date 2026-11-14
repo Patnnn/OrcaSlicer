@@ -469,11 +469,11 @@ void PathTraceRenderer::render_fps_overlay(ImGuiWrapper& imgui) const
         } else {
             imgui.text(std::string("PT: GPU [") + std::to_string(display_spp) + " / " + std::to_string(m_max_samples) + " spp]");
         }
-        if (m_gpu_dispatch_full_res_ms > 0.0f || m_gpu_dispatch_interactive_ms > 0.0f) {
+        if (!m_gpu_dispatch_full_res_ms.empty() || !m_gpu_dispatch_interactive_ms.empty()) {
             char time_buf[128];
             snprintf(time_buf, sizeof(time_buf), "PT GPU: Full %.2f ms | Orbit %.2f ms",
-                     m_gpu_dispatch_full_res_ms > 0.0f ? m_gpu_dispatch_full_res_ms : m_gpu_dispatch_time_ms,
-                     m_gpu_dispatch_interactive_ms);
+                     !m_gpu_dispatch_full_res_ms.empty() ? m_gpu_dispatch_full_res_ms.value() : m_gpu_dispatch_time_ms,
+                     m_gpu_dispatch_interactive_ms.value());
             imgui.text(std::string(time_buf));
             // Keep the width of the widest times, so that the overlay does not resize as they change.
             const float reserved = ImGui::CalcTextSize("PT GPU: Full 000.00 ms | Orbit 000.00 ms").x;
@@ -1615,7 +1615,7 @@ void PathTraceRenderer::read_back_gpu_times(int write_query_idx, int read_query_
         const float elapsed_ms = float(double(end_ns > begin_ns ? end_ns - begin_ns : 0) * 1e-6);
         m_gpu_dispatch_time_ms = elapsed_ms;
         if (m_gpu_timer_is_interactive[slot]) {
-            m_gpu_dispatch_interactive_ms = elapsed_ms;
+            m_gpu_dispatch_interactive_ms.add(elapsed_ms);
             // The cost of an interactive frame follows its pixel count, so the scale that meets
             // the 8 ms target follows from the one measured at once. It drops straight there,
             // which takes one frame instead of a dozen when orbiting starts at a high scale, and
@@ -1629,7 +1629,7 @@ void PathTraceRenderer::read_back_gpu_times(int write_query_idx, int read_query_
                 m_dynamic_orbit_scale = std::clamp(next_scale, min_orbit_scale, max_orbit_scale);
             }
         } else {
-            m_gpu_dispatch_full_res_ms = elapsed_ms;
+            m_gpu_dispatch_full_res_ms.add(elapsed_ms);
             if (m_gpu_timer_tiles[slot] > 0)
                 m_gpu_ms_per_tile = elapsed_ms / float(m_gpu_timer_tiles[slot]);
         }
@@ -2158,7 +2158,7 @@ bool PathTraceRenderer::render(const Camera& source_camera, const Size& canvas_s
             m_gpu_samples = 1;
             m_tile_cursor = 0;
             m_tiles_per_frame = 4u;
-            m_gpu_dispatch_full_res_ms = 0.0f;
+            m_gpu_dispatch_full_res_ms.clear();
             m_gpu_ms_per_tile = 0.0f;
             m_gpu_timer_tiles[write_query_idx] = 0;
             m_gpu_interactive_size = {render_width, render_height};
