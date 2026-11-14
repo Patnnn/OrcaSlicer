@@ -400,7 +400,8 @@ public:
     // tracer reads them whenever it rebuilds its scene.
     std::vector<indexed_triangle_set> its_per_color;
     bool                              IsTransparent();
-    const std::vector<ColorRGBA>& get_colors() const { return m_colors; }
+    const std::vector<ColorRGBA>&     colors() const { return m_colors; }
+    std::vector<ColorRGBA>&           colors() { return m_colors; }
 
 private:
     std::vector<ColorRGBA> m_colors;

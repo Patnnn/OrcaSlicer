@@ -149,6 +149,31 @@ void Viewer::set_translucent_filaments(bool value)
     m_impl->set_translucent_filaments(value);
 }
 
+void Viewer::set_reduced_detail_mode(EReducedDetailMode mode)
+{
+    m_impl->set_reduced_detail_mode(mode);
+}
+
+void Viewer::set_reduced_detail_hide_infill(bool value)
+{
+    m_impl->set_reduced_detail_hide_infill(value);
+}
+
+void Viewer::set_reduced_detail(bool value)
+{
+    m_impl->set_reduced_detail(value);
+}
+
+bool Viewer::is_reduced_detail() const
+{
+    return m_impl->is_reduced_detail();
+}
+
+Interval Viewer::get_reduced_detail_whole_layers() const
+{
+    return m_impl->get_reduced_detail_whole_layers();
+}
+
 bool Viewer::is_option_visible(EOptionType type) const
 {
     return m_impl->is_option_visible(type);
@@ -377,6 +402,11 @@ uint8_t Viewer::get_vertex_alpha(const PathVertex& vertex) const
 LayerShading Viewer::get_layer_shading() const
 {
     return m_impl->get_layer_shading();
+}
+
+size_t Viewer::find_extrusion_vertex(const Interval& layers, EGCodeExtrusionRole role, const XYBox& box) const
+{
+    return m_impl->find_extrusion_vertex(layers, role, box);
 }
 
 size_t Viewer::get_extrusion_roles_count() const

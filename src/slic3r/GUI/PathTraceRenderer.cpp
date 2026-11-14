@@ -332,7 +332,8 @@ bool PathTraceRenderer::is_enabled() const
     if (gizmo == GLGizmosManager::Seam ||
         gizmo == GLGizmosManager::FdmSupports ||
         gizmo == GLGizmosManager::FuzzySkin ||
-        gizmo == GLGizmosManager::MmSegmentation)
+        gizmo == GLGizmosManager::MmSegmentation ||
+        gizmo == GLGizmosManager::PaintedModifier)
         return false;
     // The layer height editor and X-Ray draw the objects through their own shaders, as the painting
     // gizmos do.
@@ -1014,7 +1015,7 @@ void PathTraceRenderer::extract_prepare_volumes(
             const auto* wt = dynamic_cast<const GLWipeTowerVolume*>(volume);
             if (wt == nullptr)
                 return;
-            const std::vector<ColorRGBA>& wt_colors = wt->get_colors();
+            const std::vector<ColorRGBA>& wt_colors = wt->colors();
             for (size_t c = 0; c < wt->its_per_color.size(); ++c) {
                 const indexed_triangle_set& its = wt->its_per_color[c];
                 if (its.indices.empty())
@@ -1757,7 +1758,7 @@ bool PathTraceRenderer::render(const Camera& source_camera, const Size& canvas_s
                         combine_geom(m.vertices_count());
                         combine_geom(m.indices_count());
                     }
-                    for (const auto& c : wt->get_colors()) {
+                    for (const auto& c : wt->colors()) {
                         combine_geom(c.r());
                         combine_geom(c.g());
                         combine_geom(c.b());
